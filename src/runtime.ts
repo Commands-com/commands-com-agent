@@ -666,6 +666,7 @@ class AgentRuntime {
         model: this.config.model,
         resumeSessionId: session.claudeSessionId,
         mcpServers: this.config.mcpServers,
+        policy: this.config.policy,
       });
       if (result.sessionId) {
         session.claudeSessionId = result.sessionId;

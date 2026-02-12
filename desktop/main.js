@@ -148,6 +148,10 @@ function clamp(value, min, max) {
 
 function buildAgentEnv(payload) {
   const env = { ...process.env };
+  // Prevent inherited shell env from forcing external MCP config in desktop mode.
+  delete env.MCP_CONFIG;
+  delete env.MCP_FILESYSTEM_ENABLED;
+  delete env.MCP_FILESYSTEM_ROOT;
 
   if (typeof payload?.gatewayUrl === 'string' && payload.gatewayUrl.trim()) {
     env.GATEWAY_URL = payload.gatewayUrl.trim();
@@ -161,8 +165,14 @@ function buildAgentEnv(payload) {
   if (typeof payload?.model === 'string' && payload.model.trim()) {
     env.MODEL = payload.model.trim();
   }
+  if (typeof payload?.permissionProfile === 'string' && payload.permissionProfile.trim()) {
+    env.PERMISSION_PROFILE = payload.permissionProfile.trim();
+  }
   if (typeof payload?.mcpFilesystemRoot === 'string' && payload.mcpFilesystemRoot.trim()) {
     env.MCP_FILESYSTEM_ROOT = payload.mcpFilesystemRoot.trim();
+  }
+  if (typeof payload?.mcpFilesystemEnabled === 'boolean') {
+    env.MCP_FILESYSTEM_ENABLED = payload.mcpFilesystemEnabled ? '1' : '0';
   }
   if (typeof payload?.auditLogPath === 'string' && payload.auditLogPath.trim()) {
     env.AUDIT_LOG_PATH = resolveAuditLogPath(payload.auditLogPath, resolveAgentRoot(payload));
@@ -227,6 +237,8 @@ async function startAgent(payload = {}) {
     deviceName: env.DEVICE_NAME || null,
     defaultCwd: env.DEFAULT_CWD || null,
     model: env.MODEL || null,
+    permissionProfile: env.PERMISSION_PROFILE || null,
+    mcpFilesystemEnabled: env.MCP_FILESYSTEM_ENABLED || null,
     auditLogPath: env.AUDIT_LOG_PATH || defaultAuditLogPath(),
     authMode: env.AUTH_MODE || 'oauth',
     forceInit: env.INIT_AGENT === '1',

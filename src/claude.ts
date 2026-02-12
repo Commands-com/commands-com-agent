@@ -113,11 +113,12 @@ export async function runPrompt(input: RunPromptInput): Promise<ClaudeRunResult>
     options.resume = input.resumeSessionId;
   }
 
-  if (input.mcpServers && Object.keys(input.mcpServers).length > 0) {
-    options.mcpServers = input.mcpServers;
-  }
-
   if (input.policy) {
+    // Policy-managed profiles run in SDK isolation so local/global Claude
+    // settings cannot silently expand permissions.
+    options.settingSources = [];
+    options.strictMcpConfig = true;
+
     const promptViolation = getPromptPolicyViolation(input.prompt, input.policy);
     if (promptViolation) {
       throw new Error(`policy_violation_${promptViolation}`);
@@ -128,9 +129,15 @@ export async function runPrompt(input: RunPromptInput): Promise<ClaudeRunResult>
       throw new Error(`policy_violation_${cwdViolation}`);
     }
 
-    options.permissionMode = 'default';
+    options.permissionMode = 'dontAsk';
     options.disallowedTools = [...input.policy.disallowedTools];
     options.additionalDirectories = [...input.policy.allowedCwdRoots];
+    if (input.policy.preset === 'safe') {
+      // Defense-in-depth for read-only profile: no MCP tool surface.
+      options.tools = ['Read', 'Grep', 'Glob', 'LS'];
+    } else if (input.mcpServers && Object.keys(input.mcpServers).length > 0) {
+      options.mcpServers = input.mcpServers;
+    }
     options.canUseTool = async (toolName, toolInput) => {
       const violation = getToolPolicyViolation(toolName, toolInput, input.policy as AgentPolicy);
       if (violation) {
@@ -164,6 +171,10 @@ export async function runPrompt(input: RunPromptInput): Promise<ClaudeRunResult>
       };
     };
   } else {
+    // Full profile: allow SDK defaults, including standard settings sources.
+    if (input.mcpServers && Object.keys(input.mcpServers).length > 0) {
+      options.mcpServers = input.mcpServers;
+    }
     options.permissionMode = 'bypassPermissions';
     options.allowDangerouslySkipPermissions = true;
   }

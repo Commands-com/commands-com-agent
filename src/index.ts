@@ -19,7 +19,8 @@ import { acknowledgeHandshake } from './handshake.js';
 import { startRuntime } from './runtime.js';
 import { describeMcpServers, loadMcpServersFromFile } from './mcp.js';
 import { refreshGatewayOAuthToken, runGatewayOAuthLogin } from './oauth.js';
-import type { AgentConfig, AgentMcpServers } from './types.js';
+import { createDefaultPolicy } from './policy.js';
+import type { AgentConfig, AgentMcpServers, PermissionProfile } from './types.js';
 
 type ParsedArgs = {
   command: string;
@@ -103,6 +104,24 @@ function isRefreshTokenMissingError(message: string): boolean {
   return normalized.includes('refresh token not found or expired');
 }
 
+function isPermissionProfile(value: string): value is PermissionProfile {
+  return value === 'read-only' || value === 'dev-safe' || value === 'full';
+}
+
+function resolvePermissionProfile(
+  candidate: string | undefined,
+  fallback: PermissionProfile = 'dev-safe'
+): PermissionProfile {
+  if (candidate && candidate.trim().length > 0) {
+    const normalized = candidate.trim().toLowerCase();
+    if (!isPermissionProfile(normalized)) {
+      throw new Error(`Invalid permission profile "${candidate}". Use read-only, dev-safe, or full.`);
+    }
+    return normalized;
+  }
+  return fallback;
+}
+
 async function resolveMcpServers(
   flags: Map<string, string>,
   fallback: AgentMcpServers | undefined
@@ -135,6 +154,24 @@ function generatedDeviceID(userID?: string, deviceName?: string): string {
   return `dev-${userPart}-${suffix}`;
 }
 
+function createRuntimePolicy(permissionProfile: PermissionProfile, allowedRoot: string): AgentConfig['policy'] {
+  if (permissionProfile === 'full') {
+    return undefined;
+  }
+
+  if (permissionProfile === 'read-only') {
+    return createDefaultPolicy({
+      preset: 'safe',
+      allowedRoot,
+    });
+  }
+
+  return createDefaultPolicy({
+    preset: 'balanced',
+    allowedRoot,
+  });
+}
+
 function printHelp(): void {
   console.log(`commands-com-agent
 
@@ -151,8 +188,8 @@ Examples:
   commands-agent login --gateway-url https://commands.com --device-name "office-mac"
   commands-agent login --gateway-url https://commands.com --headless
   commands-agent init --gateway-url https://commands.com --device-id dev_123 --device-token <token>
-  commands-agent run --prompt "Summarize this repository" --cwd /Users/me/Code/app
-  commands-agent start --default-cwd /Users/me/Code --heartbeat-ms 15000 --audit-log-path ~/.commands-agent/audit.log
+  commands-agent run --prompt "Summarize this repository" --cwd /Users/me/Code/app --permission-profile read-only
+  commands-agent start --default-cwd /Users/me/Code --heartbeat-ms 15000 --audit-log-path ~/.commands-agent/audit.log --permission-profile dev-safe
 `);
 }
 
@@ -184,6 +221,8 @@ async function cmdLogin(flags: Map<string, string>): Promise<void> {
   }
   const namedDeviceID = requestedDeviceName ? generatedDeviceID(oauth.userID, requestedDeviceName) : '';
   const existing = await loadConfig();
+  const defaultPermissionProfile = resolvePermissionProfile(existing?.permissionProfile, 'dev-safe');
+  const permissionProfile = resolvePermissionProfile(flags.get('permission-profile')?.trim(), defaultPermissionProfile);
   const canReuseExisting =
     !!existing &&
     normalizeGatewayUrl(existing.gatewayUrl) === gatewayUrl &&
@@ -202,6 +241,7 @@ async function cmdLogin(flags: Map<string, string>): Promise<void> {
     deviceId,
     deviceToken: oauth.accessToken,
     model,
+    permissionProfile,
     identity,
     ...(mcpServers ? { mcpServers } : {}),
     ...(oauth.refreshToken ? { refreshToken: oauth.refreshToken } : {}),
@@ -237,6 +277,7 @@ async function cmdLogin(flags: Map<string, string>): Promise<void> {
   console.log(`[auth] login complete${oauth.email ? ` for ${oauth.email}` : ''}`);
   console.log(`Registered identity key for device ${config.deviceId}`);
   console.log(`Identity fingerprint: ${shortFingerprint(config.identity.publicKeyRawBase64)}`);
+  console.log(`Permission profile: ${config.permissionProfile}`);
   console.log(`Token expires at: ${expiresAt}`);
 }
 
@@ -245,6 +286,7 @@ async function cmdInit(flags: Map<string, string>): Promise<void> {
   const deviceId = required(flags, 'device-id');
   const deviceToken = required(flags, 'device-token');
   const model = optional(flags, 'model', 'sonnet');
+  const permissionProfile = resolvePermissionProfile(flags.get('permission-profile')?.trim(), 'dev-safe');
 
   const mcpServers = await resolveMcpServers(flags, undefined);
   const identity = generateIdentity();
@@ -255,6 +297,7 @@ async function cmdInit(flags: Map<string, string>): Promise<void> {
     deviceId,
     deviceToken,
     model,
+    permissionProfile,
     identity,
     ...(mcpServers ? { mcpServers } : {}),
   };
@@ -279,6 +322,7 @@ async function cmdInit(flags: Map<string, string>): Promise<void> {
 
   console.log(`Registered identity key for device ${config.deviceId}`);
   console.log(`Identity fingerprint: ${shortFingerprint(config.identity.publicKeyRawBase64)}`);
+  console.log(`Permission profile: ${config.permissionProfile}`);
 }
 
 async function cmdStatus(flags: Map<string, string>): Promise<void> {
@@ -293,6 +337,7 @@ async function cmdStatus(flags: Map<string, string>): Promise<void> {
       gateway: config.gatewayUrl,
       deviceId: config.deviceId,
       model: config.model,
+      permissionProfile: config.permissionProfile ?? 'dev-safe',
       mcpServers: config.mcpServers ? Object.keys(config.mcpServers) : [],
       identityFingerprint: shortFingerprint(config.identity.publicKeyRawBase64),
       tokenExpiresAt: config.tokenExpiresAt ?? null,
@@ -308,6 +353,7 @@ async function cmdStatus(flags: Map<string, string>): Promise<void> {
   console.log(`Gateway: ${config.gatewayUrl}`);
   console.log(`Device: ${config.deviceId}`);
   console.log(`Model: ${config.model}`);
+  console.log(`Permission profile: ${config.permissionProfile ?? 'dev-safe'}`);
   console.log(`MCP servers: ${describeMcpServers(config.mcpServers)}`);
   console.log(`Identity fingerprint: ${shortFingerprint(config.identity.publicKeyRawBase64)}`);
   if (config.ownerEmail || config.ownerUID) {
@@ -323,6 +369,7 @@ async function cmdStatus(flags: Map<string, string>): Promise<void> {
 async function cmdRun(flags: Map<string, string>, positionals: string[]): Promise<void> {
   const config = await requireConfig();
   const cwd = optional(flags, 'cwd', process.cwd());
+  const permissionProfile = resolvePermissionProfile(flags.get('permission-profile')?.trim(), config.permissionProfile ?? 'dev-safe');
   const promptFromFlag = flags.get('prompt')?.trim() ?? '';
   const promptFromPositional = positionals.join(' ').trim();
   const prompt = promptFromFlag || promptFromPositional;
@@ -339,12 +386,14 @@ async function cmdRun(flags: Map<string, string>, positionals: string[]): Promis
   if (mcpServers) {
     console.log(`MCP servers: ${describeMcpServers(mcpServers)}`);
   }
+  console.log(`Permission profile: ${permissionProfile}`);
 
   const result = await runPrompt({
     prompt,
     cwd,
     model: config.model,
     mcpServers,
+    policy: createRuntimePolicy(permissionProfile, cwd),
   });
 
   console.log('\n=== Final Result ===');
@@ -389,6 +438,11 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
   const auditLogPath = optional(flags, 'audit-log-path', path.join(CONFIG_DIR, 'audit.log'));
   const modelOverride = flags.get('model')?.trim();
   const selectedModel = modelOverride && modelOverride.length > 0 ? modelOverride : config.model;
+  const permissionProfile = resolvePermissionProfile(
+    flags.get('permission-profile')?.trim(),
+    config.permissionProfile ?? 'dev-safe'
+  );
+  const runtimePolicy = createRuntimePolicy(permissionProfile, defaultCwd);
 
   if (reconnectMinMs > reconnectMaxMs) {
     throw new Error('reconnect-min-ms cannot be greater than reconnect-max-ms');
@@ -398,13 +452,26 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
   const effectiveConfig: AgentConfig = {
     ...config,
     model: selectedModel,
+    permissionProfile,
+    policy: runtimePolicy,
     ...(mcpServers ? { mcpServers } : {}),
   };
+  const savePersistentConfig = async (): Promise<void> => {
+    const { policy: _policy, ...persistable } = effectiveConfig;
+    await saveConfig(persistable);
+  };
 
-  if (effectiveConfig.model !== config.model) {
-    console.log(`[runtime] model override: ${effectiveConfig.model} (was ${config.model})`);
-    await saveConfig(effectiveConfig);
-    console.log('[runtime] saved updated model to local config');
+  if (effectiveConfig.model !== config.model || effectiveConfig.permissionProfile !== config.permissionProfile) {
+    if (effectiveConfig.model !== config.model) {
+      console.log(`[runtime] model override: ${effectiveConfig.model} (was ${config.model})`);
+    }
+    if (effectiveConfig.permissionProfile !== config.permissionProfile) {
+      console.log(
+        `[runtime] permission profile: ${effectiveConfig.permissionProfile} (was ${config.permissionProfile ?? 'dev-safe'})`
+      );
+    }
+    await savePersistentConfig();
+    console.log('[runtime] saved updated runtime config to local config');
   }
 
   const preflight = await registerIdentityKey(
@@ -443,7 +510,7 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
           effectiveConfig.ownerEmail = refreshed.email;
         }
 
-        await saveConfig(effectiveConfig);
+        await savePersistentConfig();
         console.log('[auth] refreshed access token and updated local config');
       } catch (refreshErr) {
         const refreshMsg = refreshErr instanceof Error ? refreshErr.message : String(refreshErr);
@@ -480,7 +547,7 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
           effectiveConfig.ownerEmail = oauth.email;
         }
 
-        await saveConfig(effectiveConfig);
+        await savePersistentConfig();
         console.log('[auth] re-authenticated and updated local config');
       }
 
@@ -511,6 +578,7 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
   console.log('[runtime] starting commands-agent websocket runtime');
   console.log(`[runtime] gateway=${effectiveConfig.gatewayUrl} device=${effectiveConfig.deviceId}`);
   console.log(`[runtime] model=${effectiveConfig.model}`);
+  console.log(`[runtime] permission-profile=${effectiveConfig.permissionProfile ?? 'dev-safe'}`);
   console.log(`[runtime] default-cwd=${defaultCwd}`);
   console.log(`[runtime] audit-log=${auditLogPath}`);
   console.log(`[runtime] mcp-servers=${describeMcpServers(effectiveConfig.mcpServers)}`);

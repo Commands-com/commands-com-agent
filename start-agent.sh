@@ -9,12 +9,18 @@ DEVICE_ID="${DEVICE_ID:-}"
 DEVICE_NAME="${DEVICE_NAME:-}"
 DEVICE_TOKEN="${DEVICE_TOKEN:-}"
 MODEL="${MODEL:-sonnet}"
+PERMISSION_PROFILE="${PERMISSION_PROFILE:-dev-safe}"
 DEFAULT_CWD="${DEFAULT_CWD:-/Users/dtannen/Code/commands-com-app}"
 HEARTBEAT_MS="${HEARTBEAT_MS:-5000}"
 AUDIT_LOG_PATH="${AUDIT_LOG_PATH:-$HOME/.commands-agent/audit.log}"
+MCP_CONFIG_FROM_ENV=0
+if [[ -n "${MCP_CONFIG:-}" ]]; then
+  MCP_CONFIG_FROM_ENV=1
+fi
 DEFAULT_MCP_CONFIG_PATH="${ROOT_DIR}/mcp-servers.local.json"
 MCP_CONFIG="${MCP_CONFIG:-$DEFAULT_MCP_CONFIG_PATH}"
 MCP_FILESYSTEM_ROOT="${MCP_FILESYSTEM_ROOT:-/Users/dtannen/Code}"
+MCP_FILESYSTEM_ENABLED="${MCP_FILESYSTEM_ENABLED:-1}"
 AUTH_MODE="${AUTH_MODE:-oauth}" # oauth | manual
 HEADLESS="${HEADLESS:-0}"
 BUILD_AGENT="${BUILD_AGENT:-1}"
@@ -32,10 +38,16 @@ fi
 # DEVICE_NAME is applied during init/login only. If INIT_AGENT resolves to 0,
 # we keep the existing registered identity and skip re-auth as expected.
 
-if [[ ! -f "$MCP_CONFIG" ]]; then
-  echo "[agent] creating default MCP config at $MCP_CONFIG"
+if [[ "$MCP_FILESYSTEM_ENABLED" != "0" && "$MCP_FILESYSTEM_ENABLED" != "1" ]]; then
+  echo "[agent] MCP_FILESYSTEM_ENABLED must be 0 or 1 (got: $MCP_FILESYSTEM_ENABLED)"
+  exit 1
+fi
+
+if [[ "$MCP_CONFIG_FROM_ENV" == "0" ]]; then
   mkdir -p "$(dirname "$MCP_CONFIG")"
-  cat > "$MCP_CONFIG" <<JSON
+  if [[ "$MCP_FILESYSTEM_ENABLED" == "1" ]]; then
+    echo "[agent] writing managed MCP config (filesystem enabled) at $MCP_CONFIG"
+    cat > "$MCP_CONFIG" <<JSON
 {
   "mcpServers": {
     "filesystem": {
@@ -46,6 +58,17 @@ if [[ ! -f "$MCP_CONFIG" ]]; then
   }
 }
 JSON
+  else
+    echo "[agent] writing managed MCP config (filesystem disabled) at $MCP_CONFIG"
+    cat > "$MCP_CONFIG" <<JSON
+{
+  "mcpServers": {}
+}
+JSON
+  fi
+elif [[ ! -f "$MCP_CONFIG" ]]; then
+  echo "[agent] MCP_CONFIG was set explicitly but does not exist: $MCP_CONFIG"
+  exit 1
 fi
 
 if [[ "$BUILD_AGENT" == "1" ]]; then
@@ -59,6 +82,7 @@ if [[ "$INIT_AGENT" == "1" ]]; then
     LOGIN_ARGS=(
       --gateway-url "$GATEWAY_URL"
       --model "$MODEL"
+      --permission-profile "$PERMISSION_PROFILE"
       --mcp-config "$MCP_CONFIG"
     )
 
@@ -86,6 +110,7 @@ if [[ "$INIT_AGENT" == "1" ]]; then
       --device-id "$DEVICE_ID" \
       --device-token "$DEVICE_TOKEN" \
       --model "$MODEL" \
+      --permission-profile "$PERMISSION_PROFILE" \
       --mcp-config "$MCP_CONFIG"
   fi
 fi
@@ -94,11 +119,12 @@ echo "[agent] starting runtime"
 if [[ "$INIT_AGENT" == "0" ]]; then
   echo "[agent] using existing config at $CONFIG_FILE (skip init/login)"
 fi
-echo "[agent] gateway=$GATEWAY_URL model=$MODEL cwd=$DEFAULT_CWD heartbeat_ms=$HEARTBEAT_MS auth_mode=$AUTH_MODE init_agent=$INIT_AGENT audit_log=$AUDIT_LOG_PATH mcp_config=$MCP_CONFIG"
+echo "[agent] gateway=$GATEWAY_URL model=$MODEL permission_profile=$PERMISSION_PROFILE cwd=$DEFAULT_CWD heartbeat_ms=$HEARTBEAT_MS auth_mode=$AUTH_MODE init_agent=$INIT_AGENT audit_log=$AUDIT_LOG_PATH mcp_config=$MCP_CONFIG mcp_filesystem_enabled=$MCP_FILESYSTEM_ENABLED"
 
 exec node dist/index.js start \
   --default-cwd "$DEFAULT_CWD" \
   --heartbeat-ms "$HEARTBEAT_MS" \
   --audit-log-path "$AUDIT_LOG_PATH" \
   --model "$MODEL" \
+  --permission-profile "$PERMISSION_PROFILE" \
   --mcp-config "$MCP_CONFIG"

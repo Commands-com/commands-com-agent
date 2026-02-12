@@ -709,7 +709,10 @@
     const deviceName = slugify(profile.deviceName || profile.name) || 'agent-1';
     const gatewayPrefix = state.runtime.gatewayUrl ? `GATEWAY_URL=\"${state.runtime.gatewayUrl}\" ` : '';
     const auditPrefix = state.runtime.auditLogPath ? `AUDIT_LOG_PATH=\"${state.runtime.auditLogPath}\" ` : '';
-    return `${gatewayPrefix}${auditPrefix}DEVICE_NAME=\"${deviceName}\" MODEL=${resolveModelId(profile.model)} DEFAULT_CWD=\"${profile.workspace}\" INIT_AGENT=1 ./start-agent.sh`;
+    const fsMcpEnabled = Boolean(state.mcp.filesystem && state.mcp.filesystem.enabled);
+    const fsMcpFlag = `MCP_FILESYSTEM_ENABLED=${fsMcpEnabled ? '1' : '0'} `;
+    const fsRootPrefix = fsMcpEnabled ? `MCP_FILESYSTEM_ROOT=\"${resolveFilesystemRoot(profile)}\" ` : '';
+    return `${gatewayPrefix}${auditPrefix}${fsMcpFlag}${fsRootPrefix}DEVICE_NAME=\"${deviceName}\" MODEL=${resolveModelId(profile.model)} PERMISSION_PROFILE=\"${profile.permissions}\" DEFAULT_CWD=\"${profile.workspace}\" INIT_AGENT=1 ./start-agent.sh`;
   }
 
   function splitLogLines(message) {
@@ -860,12 +863,16 @@
       deviceName: slugify(profile.deviceName || profile.name) || 'agent-1',
       defaultCwd: profile.workspace,
       model: resolveModelId(profile.model),
+      permissionProfile: profile.permissions,
       auditLogPath: state.runtime.auditLogPath,
-      mcpFilesystemRoot: resolveFilesystemRoot(profile),
+      mcpFilesystemEnabled: Boolean(state.mcp.filesystem && state.mcp.filesystem.enabled),
       forceInit: Boolean(state.runtime.forceInit),
       headless: Boolean(state.runtime.headless),
       authMode: 'oauth'
     };
+    if (payload.mcpFilesystemEnabled) {
+      payload.mcpFilesystemRoot = resolveFilesystemRoot(profile);
+    }
 
     try {
       const result = await window.commandsDesktop.startAgent(payload);

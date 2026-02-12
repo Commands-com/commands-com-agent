@@ -39,6 +39,27 @@ const DEFAULT_BASH_DENY_PATTERNS = [
   ':\\(\\)\\s*\\{\\s*:\\|:\\s*&\\s*\\};:',
 ];
 
+const READ_ONLY_MUTATING_TOOL_PATTERNS: RegExp[] = [
+  /\bwrite\b/i,
+  /\bedit\b/i,
+  /\bmulti\s*edit\b/i,
+  /\bnotebook\s*edit\b/i,
+  /\bnotebook\s*write\b/i,
+  /\bappend\b/i,
+  /\binsert\b/i,
+  /\breplace\b/i,
+  /\bdelete\b/i,
+  /\bremove\b/i,
+  /\bunlink\b/i,
+  /\brename\b/i,
+  /\bmove\b/i,
+  /\btouch\b/i,
+  /\bmkdir\b/i,
+  /\brmdir\b/i,
+  /\bcreate\s*(file|dir|directory|folder)\b/i,
+  /\bcopy\s*(file|dir|directory|folder)\b/i,
+];
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
@@ -111,6 +132,24 @@ function getBashCommand(input: Record<string, unknown>): string {
     }
   }
   return '';
+}
+
+function normalizeToolNameForPattern(toolName: string): string {
+  return toolName
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isMutatingToolName(toolName: string): boolean {
+  const normalized = normalizeToolNameForPattern(toolName);
+  if (!normalized) {
+    return false;
+  }
+
+  return READ_ONLY_MUTATING_TOOL_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
 function normalizePolicy(policy: AgentPolicy): AgentPolicy {
@@ -287,6 +326,12 @@ export function getToolPolicyViolation(
   const disallowed = policy.disallowedTools.some((tool) => tool.trim().toLowerCase() === lowerToolName);
   if (disallowed) {
     return `tool_disallowed_${toolName}`;
+  }
+
+  // "safe" preset is our read-only mode. Deny mutating tools even when they
+  // come from MCP servers with names like "filesystem__write_file".
+  if (policy.preset === 'safe' && isMutatingToolName(toolName)) {
+    return `tool_disallowed_read_only_${toolName}`;
   }
 
   if (toolName === BASH_TOOL_NAME) {
