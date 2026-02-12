@@ -1,7 +1,9 @@
 const path = require('node:path');
+const os = require('node:os');
 const fs = require('node:fs/promises');
 const { spawn } = require('node:child_process');
 const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
+const MAX_AUDIT_RETURN_ENTRIES = 2000;
 
 let agentProcess = null;
 let forceKillTimer = null;
@@ -87,6 +89,63 @@ function resolveAgentRoot(payload) {
   return path.resolve(__dirname, '..');
 }
 
+function defaultAuditLogPath() {
+  return path.join(os.homedir(), '.commands-agent', 'audit.log');
+}
+
+function resolveAuditLogPath(rawPath, agentRoot) {
+  let candidate =
+    typeof rawPath === 'string' && rawPath.trim()
+      ? rawPath.trim()
+      : defaultAuditLogPath();
+
+  if (candidate.startsWith('~/')) {
+    candidate = path.join(os.homedir(), candidate.slice(2));
+  } else if (candidate === '~') {
+    candidate = os.homedir();
+  }
+
+  if (!path.isAbsolute(candidate)) {
+    const base = typeof agentRoot === 'string' && agentRoot.trim() ? agentRoot.trim() : process.cwd();
+    candidate = path.resolve(base, candidate);
+  }
+
+  return path.normalize(candidate);
+}
+
+function parseIsoDateOrNull(value) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    return null;
+  }
+  const date = new Date(value.trim());
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  return date.toISOString();
+}
+
+function extractAuditTimestamp(entry) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+
+  const at = typeof entry.at === 'string' ? entry.at : '';
+  if (at.trim()) {
+    return at.trim();
+  }
+
+  const receivedAt = typeof entry.received_at === 'string' ? entry.received_at : '';
+  if (receivedAt.trim()) {
+    return receivedAt.trim();
+  }
+
+  return null;
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
 function buildAgentEnv(payload) {
   const env = { ...process.env };
 
@@ -104,6 +163,9 @@ function buildAgentEnv(payload) {
   }
   if (typeof payload?.mcpFilesystemRoot === 'string' && payload.mcpFilesystemRoot.trim()) {
     env.MCP_FILESYSTEM_ROOT = payload.mcpFilesystemRoot.trim();
+  }
+  if (typeof payload?.auditLogPath === 'string' && payload.auditLogPath.trim()) {
+    env.AUDIT_LOG_PATH = resolveAuditLogPath(payload.auditLogPath, resolveAgentRoot(payload));
   }
   if (payload?.forceInit === true) {
     env.INIT_AGENT = '1';
@@ -165,6 +227,7 @@ async function startAgent(payload = {}) {
     deviceName: env.DEVICE_NAME || null,
     defaultCwd: env.DEFAULT_CWD || null,
     model: env.MODEL || null,
+    auditLogPath: env.AUDIT_LOG_PATH || defaultAuditLogPath(),
     authMode: env.AUTH_MODE || 'oauth',
     forceInit: env.INIT_AGENT === '1',
     headless: env.HEADLESS === '1'
@@ -296,6 +359,148 @@ ipcMain.handle('desktop:pick-directory', async (event, payload) => {
   }
 
   return { ok: true, path: result.filePaths[0] };
+});
+
+ipcMain.handle('desktop:audit:read', async (_event, payload) => {
+  const agentRoot = resolveAgentRoot(payload);
+  const auditLogPath = resolveAuditLogPath(payload?.auditLogPath, agentRoot);
+  const requestedLimit = Number(payload?.limit);
+  const limit = Number.isFinite(requestedLimit)
+    ? clamp(Math.trunc(requestedLimit), 1, MAX_AUDIT_RETURN_ENTRIES)
+    : 200;
+
+  const search = typeof payload?.search === 'string' ? payload.search.trim().toLowerCase() : '';
+  const requester = typeof payload?.requester === 'string' ? payload.requester.trim().toLowerCase() : '';
+  const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId.trim().toLowerCase() : '';
+  const eventType = typeof payload?.event === 'string' ? payload.event.trim().toLowerCase() : '';
+  const fromIso = parseIsoDateOrNull(payload?.from);
+  const toIso = parseIsoDateOrNull(payload?.to);
+  const fromMs = fromIso ? Date.parse(fromIso) : null;
+  const toMs = toIso ? Date.parse(toIso) : null;
+
+  let content = '';
+  try {
+    content = await fs.readFile(auditLogPath, 'utf8');
+  } catch (err) {
+    const code = err && typeof err === 'object' ? err.code : null;
+    if (code === 'ENOENT') {
+      return {
+        ok: true,
+        auditLogPath,
+        entries: [],
+        requester_uids: [],
+        summary: {
+          totalLines: 0,
+          parsedEntries: 0,
+          matches: 0,
+          returned: 0,
+          parseErrors: 0,
+          missing: true
+        }
+      };
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: msg, auditLogPath };
+  }
+
+  const lines = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+
+  let parseErrors = 0;
+  const parsedEntries = [];
+
+  lines.forEach((line) => {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed && typeof parsed === 'object') {
+        parsedEntries.push(parsed);
+      } else {
+        parseErrors += 1;
+      }
+    } catch (_err) {
+      parseErrors += 1;
+    }
+  });
+
+  const requesterUIDs = Array.from(new Set(
+    parsedEntries
+      .map((entry) => (typeof entry.requester_uid === 'string' ? entry.requester_uid.trim() : ''))
+      .filter((uid) => uid.length > 0)
+  )).sort((a, b) => a.localeCompare(b));
+
+  const matches = parsedEntries.filter((entry) => {
+    const asRecord = entry;
+    const rawSearchText = JSON.stringify(asRecord).toLowerCase();
+
+    if (search && !rawSearchText.includes(search)) {
+      return false;
+    }
+
+    if (requester) {
+      const requesterUid =
+        (typeof asRecord.requester_uid === 'string' && asRecord.requester_uid.toLowerCase()) || '';
+      if (!requesterUid.includes(requester)) {
+        return false;
+      }
+    }
+
+    if (sessionId) {
+      const session =
+        (typeof asRecord.session_id === 'string' && asRecord.session_id.toLowerCase()) || '';
+      if (!session.includes(sessionId)) {
+        return false;
+      }
+    }
+
+    if (eventType) {
+      const eventName =
+        (typeof asRecord.event === 'string' && asRecord.event.toLowerCase()) || '';
+      if (!eventName.includes(eventType)) {
+        return false;
+      }
+    }
+
+    if (fromMs != null || toMs != null) {
+      const timestamp = extractAuditTimestamp(asRecord);
+      const timestampMs = timestamp ? Date.parse(timestamp) : Number.NaN;
+      if (!Number.isFinite(timestampMs)) {
+        return false;
+      }
+      if (fromMs != null && timestampMs < fromMs) {
+        return false;
+      }
+      if (toMs != null && timestampMs > toMs) {
+        return false;
+      }
+    }
+
+    return true;
+  });
+
+  matches.sort((a, b) => {
+    const aTs = extractAuditTimestamp(a) || '';
+    const bTs = extractAuditTimestamp(b) || '';
+    return aTs.localeCompare(bTs);
+  });
+
+  const entries = matches.slice(-limit).reverse();
+
+  return {
+    ok: true,
+    auditLogPath,
+    entries,
+    requester_uids: requesterUIDs,
+    summary: {
+      totalLines: lines.length,
+      parsedEntries: parsedEntries.length,
+      matches: matches.length,
+      returned: entries.length,
+      parseErrors,
+      missing: false
+    }
+  };
 });
 
 ipcMain.handle('desktop:agent:start', async (_event, payload) => startAgent(payload || {}));

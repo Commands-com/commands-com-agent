@@ -2,6 +2,8 @@
   const STORAGE_KEY = 'commands.desktop.setupWizard.v1';
   const DEFAULT_GATEWAY_URL = 'http://localhost:8091';
   const MAX_RUNTIME_LOG_LINES = 600;
+  const DEFAULT_AUDIT_LIMIT = 200;
+  const MAX_AUDIT_LIMIT = 2000;
 
   const MODEL_OPTIONS = [
     { value: 'opus', label: 'Opus (max quality)' },
@@ -83,7 +85,8 @@
     { id: 2, title: 'MCP Modules' },
     { id: 3, title: 'Scheduler' },
     { id: 4, title: 'Run & Validate' },
-    { id: 5, title: 'Review' }
+    { id: 5, title: 'Review' },
+    { id: 6, title: 'Audit Trail' }
   ];
 
   const el = {
@@ -93,7 +96,8 @@
       document.getElementById('step-2'),
       document.getElementById('step-3'),
       document.getElementById('step-4'),
-      document.getElementById('step-5')
+      document.getElementById('step-5'),
+      document.getElementById('step-6')
     ],
     prev: document.getElementById('prev-step'),
     next: document.getElementById('next-step'),
@@ -114,6 +118,16 @@
       launchConfig: null
     },
     logs: []
+  };
+
+  const auditUi = {
+    loading: false,
+    loaded: false,
+    entries: [],
+    requesterOptions: [],
+    summary: null,
+    error: '',
+    lastLoadedAt: ''
   };
 
   function randId(prefix) {
@@ -171,8 +185,22 @@
     return {
       gatewayUrl: DEFAULT_GATEWAY_URL,
       profileId: '',
+      auditLogPath: '',
       forceInit: false,
       headless: false
+    };
+  }
+
+  function defaultAuditConfig() {
+    return {
+      search: '',
+      requester: '',
+      sessionId: '',
+      event: 'session.message.received',
+      from: '',
+      to: '',
+      limit: DEFAULT_AUDIT_LIMIT,
+      messagesOnly: true
     };
   }
 
@@ -227,6 +255,10 @@
     if (typeof runtime.profileId !== 'string') {
       runtime.profileId = '';
     }
+    if (typeof runtime.auditLogPath !== 'string') {
+      runtime.auditLogPath = '';
+    }
+    runtime.auditLogPath = runtime.auditLogPath.trim();
     runtime.forceInit = Boolean(runtime.forceInit);
     runtime.headless = Boolean(runtime.headless);
 
@@ -234,11 +266,30 @@
       runtime.profileId = profiles[0]?.id || '';
     }
 
+    const auditRaw = raw.audit && typeof raw.audit === 'object' ? raw.audit : {};
+    const audit = {
+      ...defaultAuditConfig(),
+      ...auditRaw
+    };
+
+    if (typeof audit.search !== 'string') audit.search = '';
+    if (typeof audit.requester !== 'string') audit.requester = '';
+    if (typeof audit.sessionId !== 'string') audit.sessionId = '';
+    if (typeof audit.event !== 'string') audit.event = '';
+    if (typeof audit.from !== 'string') audit.from = '';
+    if (typeof audit.to !== 'string') audit.to = '';
+    audit.messagesOnly = audit.messagesOnly !== false;
+    if (!Number.isFinite(Number(audit.limit))) {
+      audit.limit = DEFAULT_AUDIT_LIMIT;
+    }
+    audit.limit = clamp(Math.trunc(Number(audit.limit)), 1, MAX_AUDIT_LIMIT);
+
     return {
-      step: Number.isInteger(raw.step) ? clamp(raw.step, 1, 5) : 1,
+      step: Number.isInteger(raw.step) ? clamp(raw.step, 1, stepMeta.length) : 1,
       profiles,
       mcp: { ...defaultMcpSelections(), ...(raw.mcp || {}) },
-      runtime
+      runtime,
+      audit
     };
   }
 
@@ -273,7 +324,7 @@
   }
 
   function setStep(step) {
-    state.step = clamp(step, 1, 5);
+    state.step = clamp(step, 1, stepMeta.length);
     render();
     persist();
   }
@@ -657,7 +708,8 @@
     if (!profile) return '# Add at least one profile';
     const deviceName = slugify(profile.deviceName || profile.name) || 'agent-1';
     const gatewayPrefix = state.runtime.gatewayUrl ? `GATEWAY_URL=\"${state.runtime.gatewayUrl}\" ` : '';
-    return `${gatewayPrefix}DEVICE_NAME=\"${deviceName}\" MODEL=${resolveModelId(profile.model)} DEFAULT_CWD=\"${profile.workspace}\" INIT_AGENT=1 ./start-agent.sh`;
+    const auditPrefix = state.runtime.auditLogPath ? `AUDIT_LOG_PATH=\"${state.runtime.auditLogPath}\" ` : '';
+    return `${gatewayPrefix}${auditPrefix}DEVICE_NAME=\"${deviceName}\" MODEL=${resolveModelId(profile.model)} DEFAULT_CWD=\"${profile.workspace}\" INIT_AGENT=1 ./start-agent.sh`;
   }
 
   function splitLogLines(message) {
@@ -741,6 +793,9 @@
     if (launch && launch.gatewayUrl) {
       parts.push(`Gateway: ${launch.gatewayUrl}`);
     }
+    if (launch && launch.auditLogPath) {
+      parts.push(`Audit: ${launch.auditLogPath}`);
+    }
     return parts.join(' | ');
   }
 
@@ -805,6 +860,7 @@
       deviceName: slugify(profile.deviceName || profile.name) || 'agent-1',
       defaultCwd: profile.workspace,
       model: resolveModelId(profile.model),
+      auditLogPath: state.runtime.auditLogPath,
       mcpFilesystemRoot: resolveFilesystemRoot(profile),
       forceInit: Boolean(state.runtime.forceInit),
       headless: Boolean(state.runtime.headless),
@@ -860,29 +916,7 @@
   }
 
   async function savePayloadToFile(payload) {
-    const filename = `commands-agent-setup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
-    const data = JSON.stringify(payload, null, 2);
-    try {
-      if (window.commandsDesktop && window.commandsDesktop.saveJson) {
-        const result = await window.commandsDesktop.saveJson({
-          defaultPath: filename,
-          data
-        });
-        if (result && result.ok) {
-          alert(`Saved: ${result.filePath}`);
-        }
-      } else {
-        const blob = new Blob([data], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = filename;
-        link.click();
-        URL.revokeObjectURL(url);
-      }
-    } catch (err) {
-      alert(`Save failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    await saveJsonObjectToFile(payload, 'commands-agent-setup');
   }
 
   async function copyCommandToClipboard(command, statusEl) {
@@ -904,6 +938,271 @@
     }
   }
 
+  function formatAuditDisplayTime(isoTimestamp) {
+    if (!isoTimestamp) return 'n/a';
+    const date = new Date(isoTimestamp);
+    if (Number.isNaN(date.getTime())) {
+      return String(isoTimestamp);
+    }
+    return date.toLocaleString();
+  }
+
+  function auditEntryTimestamp(entry) {
+    if (!entry || typeof entry !== 'object') return '';
+    if (typeof entry.at === 'string' && entry.at.trim()) {
+      return entry.at.trim();
+    }
+    if (typeof entry.received_at === 'string' && entry.received_at.trim()) {
+      return entry.received_at.trim();
+    }
+    return '';
+  }
+
+  function toIsoOrEmpty(rawValue) {
+    if (typeof rawValue !== 'string' || rawValue.trim() === '') {
+      return '';
+    }
+    const parsed = new Date(rawValue.trim());
+    if (Number.isNaN(parsed.getTime())) {
+      return '';
+    }
+    return parsed.toISOString();
+  }
+
+  function buildAuditReadPayload() {
+    return {
+      auditLogPath: state.runtime.auditLogPath,
+      search: state.audit.search,
+      requester: state.audit.requester,
+      sessionId: state.audit.sessionId,
+      event: state.audit.event,
+      from: toIsoOrEmpty(state.audit.from),
+      to: toIsoOrEmpty(state.audit.to),
+      limit: state.audit.limit
+    };
+  }
+
+  async function saveJsonObjectToFile(payload, filenamePrefix) {
+    const filename = `${filenamePrefix}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    const data = JSON.stringify(payload, null, 2);
+    try {
+      if (window.commandsDesktop && window.commandsDesktop.saveJson) {
+        const result = await window.commandsDesktop.saveJson({
+          defaultPath: filename,
+          data
+        });
+        if (result && result.ok) {
+          alert(`Saved: ${result.filePath}`);
+        }
+        return;
+      }
+
+      const blob = new Blob([data], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert(`Save failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async function refreshAuditTrail(options = {}) {
+    const silent = Boolean(options.silent);
+    if (!(window.commandsDesktop && window.commandsDesktop.readAuditLog)) {
+      auditUi.error = 'Audit view is only available in Electron desktop mode.';
+      auditUi.loading = false;
+      if (!silent) {
+        renderAuditEntriesDom();
+      }
+      return;
+    }
+
+    auditUi.loading = true;
+    auditUi.error = '';
+    if (!silent) {
+      renderAuditEntriesDom();
+    }
+
+    try {
+      const response = await window.commandsDesktop.readAuditLog(buildAuditReadPayload());
+      if (!response || !response.ok) {
+        throw new Error(response?.error || 'failed to read audit log');
+      }
+
+      auditUi.entries = Array.isArray(response.entries) ? response.entries : [];
+      auditUi.requesterOptions = Array.isArray(response.requester_uids)
+        ? response.requester_uids.map((value) => String(value || '').trim()).filter((value) => value.length > 0)
+        : [];
+      auditUi.summary = response.summary || null;
+      auditUi.loaded = true;
+      auditUi.lastLoadedAt = new Date().toISOString();
+
+      if (typeof response.auditLogPath === 'string' && response.auditLogPath.trim()) {
+        const resolvedPath = response.auditLogPath.trim();
+        if (state.runtime.auditLogPath !== resolvedPath) {
+          state.runtime.auditLogPath = resolvedPath;
+          persist();
+        }
+        const auditPathInput = document.getElementById('audit-log-path-input');
+        if (auditPathInput && auditPathInput.value !== resolvedPath) {
+          auditPathInput.value = resolvedPath;
+        }
+        const runtimeAuditPathInput = document.getElementById('runtime-audit-log-path');
+        if (runtimeAuditPathInput && runtimeAuditPathInput.value !== resolvedPath) {
+          runtimeAuditPathInput.value = resolvedPath;
+        }
+      }
+    } catch (err) {
+      auditUi.error = err instanceof Error ? err.message : String(err);
+    } finally {
+      auditUi.loading = false;
+      renderAuditEntriesDom();
+    }
+  }
+
+  function renderAuditEntriesDom() {
+    const statusEl = document.getElementById('audit-status');
+    const summaryEl = document.getElementById('audit-summary');
+    const entriesEl = document.getElementById('audit-entries');
+    const requesterSelect = document.getElementById('audit-requester-select');
+    if (!statusEl || !summaryEl || !entriesEl) {
+      return;
+    }
+
+    if (requesterSelect) {
+      const requesterSet = new Set(auditUi.requesterOptions);
+      if (state.audit.requester) {
+        requesterSet.add(state.audit.requester);
+      }
+      const requesterOptions = Array.from(requesterSet).sort((a, b) => a.localeCompare(b));
+      const nextHtml = [
+        '<option value="">All requesters</option>',
+        ...requesterOptions.map((uid) => `<option value="${escapeHtml(uid)}">${escapeHtml(uid)}</option>`)
+      ].join('');
+
+      if (requesterSelect.innerHTML !== nextHtml) {
+        requesterSelect.innerHTML = nextHtml;
+      }
+      requesterSelect.value = state.audit.requester || '';
+    }
+
+    if (auditUi.loading) {
+      statusEl.textContent = 'Loading audit log...';
+    } else if (auditUi.error) {
+      statusEl.textContent = `Error: ${auditUi.error}`;
+    } else if (auditUi.lastLoadedAt) {
+      const loadedAt = formatAuditDisplayTime(auditUi.lastLoadedAt);
+      const pathText = state.runtime.auditLogPath || '(default path)';
+      statusEl.textContent = `Loaded ${loadedAt} from ${pathText}`;
+    } else {
+      statusEl.textContent = '';
+    }
+
+    if (auditUi.summary) {
+      const summary = auditUi.summary;
+      const parseErrors = Number(summary.parseErrors || 0);
+      summaryEl.textContent = `Showing ${summary.returned || 0} of ${summary.matches || 0} matched entries (${summary.parsedEntries || 0} parsed, ${parseErrors} parse errors).`;
+    } else {
+      summaryEl.textContent = '';
+    }
+
+    if (!Array.isArray(auditUi.entries) || auditUi.entries.length === 0) {
+      entriesEl.innerHTML = '<p class="audit-empty">No audit entries match the current filter.</p>';
+      return;
+    }
+
+    entriesEl.innerHTML = auditUi.entries.map((entry, index) => {
+      const ts = auditEntryTimestamp(entry);
+      const eventName = typeof entry.event === 'string' && entry.event.trim()
+        ? entry.event.trim()
+        : 'event';
+      const requester = typeof entry.requester_uid === 'string' && entry.requester_uid.trim()
+        ? entry.requester_uid.trim()
+        : 'unknown';
+      const deviceId = typeof entry.device_id === 'string' && entry.device_id.trim()
+        ? entry.device_id.trim()
+        : 'unknown';
+      const sessionId = typeof entry.session_id === 'string' && entry.session_id.trim()
+        ? entry.session_id.trim()
+        : 'unknown';
+      const messageId = typeof entry.message_id === 'string' && entry.message_id.trim()
+        ? entry.message_id.trim()
+        : 'unknown';
+      const encrypted = entry.encrypted === true ? 'yes' : 'no';
+      const cwd = typeof entry.cwd === 'string' ? entry.cwd : '';
+      const prompt = typeof entry.prompt === 'string' ? entry.prompt : '';
+
+      if (state.audit.messagesOnly) {
+        return `
+          <article class="audit-entry">
+            <div class="audit-entry-head">
+              <span class="audit-event">${escapeHtml(requester)}</span>
+              <span class="audit-time">${escapeHtml(formatAuditDisplayTime(ts))}</span>
+            </div>
+            <p class="audit-meta">session=<code>${escapeHtml(sessionId)}</code> | message=<code>${escapeHtml(messageId)}</code></p>
+            ${
+              prompt
+                ? `<pre class="audit-prompt">${escapeHtml(prompt)}</pre>`
+                : '<p class="audit-empty">No prompt text recorded for this event.</p>'
+            }
+            <div class="row audit-entry-actions">
+              <button data-copy-audit-prompt-index="${index}" ${prompt ? '' : 'disabled'}>Copy Prompt</button>
+              <details>
+                <summary>Raw Event JSON</summary>
+                <pre class="audit-raw-json">${escapeHtml(JSON.stringify(entry, null, 2))}</pre>
+              </details>
+            </div>
+          </article>
+        `;
+      }
+
+      return `
+        <article class="audit-entry">
+          <div class="audit-entry-head">
+            <span class="audit-event">${escapeHtml(eventName)}</span>
+            <span class="audit-time">${escapeHtml(formatAuditDisplayTime(ts))}</span>
+          </div>
+          <p class="audit-meta">
+            requester=<code>${escapeHtml(requester)}</code> |
+            device=<code>${escapeHtml(deviceId)}</code> |
+            session=<code>${escapeHtml(sessionId)}</code> |
+            message=<code>${escapeHtml(messageId)}</code> |
+            encrypted=<code>${escapeHtml(encrypted)}</code>
+          </p>
+          ${cwd ? `<p class="audit-meta">cwd=<code>${escapeHtml(cwd)}</code></p>` : ''}
+          ${
+            prompt
+              ? `<pre class="audit-prompt">${escapeHtml(prompt)}</pre>`
+              : '<p class="audit-empty">No prompt text recorded for this event.</p>'
+          }
+          <div class="row audit-entry-actions">
+            <button data-copy-audit-prompt-index="${index}" ${prompt ? '' : 'disabled'}>Copy Prompt</button>
+            <details>
+              <summary>Raw Event JSON</summary>
+              <pre class="audit-raw-json">${escapeHtml(JSON.stringify(entry, null, 2))}</pre>
+            </details>
+          </div>
+        </article>
+      `;
+    }).join('');
+
+    entriesEl.querySelectorAll('[data-copy-audit-prompt-index]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const idx = Number(btn.dataset.copyAuditPromptIndex);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= auditUi.entries.length) {
+          return;
+        }
+        const entry = auditUi.entries[idx];
+        const prompt = typeof entry?.prompt === 'string' ? entry.prompt : '';
+        if (!prompt) return;
+        await copyCommandToClipboard(prompt);
+      });
+    });
+  }
+
   function wireRuntimeControls() {
     const gatewayInput = document.getElementById('runtime-gateway-url');
     if (gatewayInput) {
@@ -913,6 +1212,19 @@
       });
       gatewayInput.addEventListener('change', (event) => {
         state.runtime.gatewayUrl = event.target.value.trim() || DEFAULT_GATEWAY_URL;
+        persist();
+        renderStep4PreviewOnly();
+      });
+    }
+
+    const auditLogInput = document.getElementById('runtime-audit-log-path');
+    if (auditLogInput) {
+      auditLogInput.addEventListener('input', (event) => {
+        state.runtime.auditLogPath = event.target.value;
+        persist();
+      });
+      auditLogInput.addEventListener('change', (event) => {
+        state.runtime.auditLogPath = event.target.value.trim();
         persist();
         renderStep4PreviewOnly();
       });
@@ -966,6 +1278,101 @@
     }
   }
 
+  function wireAuditControls() {
+    const auditPathInput = document.getElementById('audit-log-path-input');
+    if (auditPathInput) {
+      auditPathInput.addEventListener('input', (event) => {
+        state.runtime.auditLogPath = event.target.value;
+        persist();
+      });
+      auditPathInput.addEventListener('change', (event) => {
+        state.runtime.auditLogPath = event.target.value.trim();
+        persist();
+      });
+    }
+
+    const filterBindings = [
+      { id: 'audit-search-input', key: 'search' },
+      { id: 'audit-session-input', key: 'sessionId' },
+      { id: 'audit-event-input', key: 'event' },
+      { id: 'audit-from-input', key: 'from' },
+      { id: 'audit-to-input', key: 'to' }
+    ];
+
+    filterBindings.forEach((binding) => {
+      const input = document.getElementById(binding.id);
+      if (!input) return;
+      input.addEventListener('input', (event) => {
+        state.audit[binding.key] = event.target.value;
+        persist();
+      });
+    });
+
+    const requesterSelect = document.getElementById('audit-requester-select');
+    if (requesterSelect) {
+      requesterSelect.addEventListener('change', async (event) => {
+        state.audit.requester = event.target.value;
+        persist();
+        await refreshAuditTrail();
+      });
+    }
+
+    const messagesOnlyCheckbox = document.getElementById('audit-messages-only');
+    if (messagesOnlyCheckbox) {
+      messagesOnlyCheckbox.addEventListener('change', (event) => {
+        state.audit.messagesOnly = event.target.checked;
+        persist();
+        renderAuditEntriesDom();
+      });
+    }
+
+    const limitInput = document.getElementById('audit-limit-input');
+    if (limitInput) {
+      limitInput.addEventListener('change', (event) => {
+        const parsed = Math.trunc(Number(event.target.value));
+        state.audit.limit = Number.isFinite(parsed)
+          ? clamp(parsed, 1, MAX_AUDIT_LIMIT)
+          : DEFAULT_AUDIT_LIMIT;
+        event.target.value = String(state.audit.limit);
+        persist();
+      });
+    }
+
+    const refreshBtn = document.getElementById('refresh-audit-btn');
+    if (refreshBtn) {
+      refreshBtn.addEventListener('click', async () => {
+        await refreshAuditTrail();
+      });
+    }
+
+    const clearFiltersBtn = document.getElementById('clear-audit-filters-btn');
+    if (clearFiltersBtn) {
+      clearFiltersBtn.addEventListener('click', () => {
+        state.audit = defaultAuditConfig();
+        persist();
+        renderStep6();
+      });
+    }
+
+    const exportBtn = document.getElementById('export-audit-btn');
+    if (exportBtn) {
+      exportBtn.addEventListener('click', async () => {
+        await saveJsonObjectToFile({
+          generated_at: new Date().toISOString(),
+          source: 'commands-com-desktop-audit',
+          audit_log_path: state.runtime.auditLogPath || null,
+          filters: {
+            ...state.audit,
+            from: toIsoOrEmpty(state.audit.from) || null,
+            to: toIsoOrEmpty(state.audit.to) || null
+          },
+          summary: auditUi.summary || null,
+          entries: auditUi.entries
+        }, 'commands-agent-audit');
+      });
+    }
+  }
+
   function renderStep4() {
     ensureRuntimeProfileId();
     const selectedProfile = getSelectedProfile();
@@ -999,6 +1406,10 @@
                 </option>
               `).join('')}
             </select>
+          </label>
+          <label style="grid-column: span 2;">
+            <span>Audit Log Path</span>
+            <input type="text" id="runtime-audit-log-path" value="${escapeHtml(state.runtime.auditLogPath)}" placeholder="~/.commands-agent/audit.log" />
           </label>
         </div>
         <div class="runtime-options">
@@ -1101,6 +1512,91 @@
     updateRuntimeStatusDom();
   }
 
+  function renderStep6() {
+    const requesterSet = new Set(auditUi.requesterOptions);
+    if (state.audit.requester && !requesterSet.has(state.audit.requester)) {
+      requesterSet.add(state.audit.requester);
+    }
+    const requesterOptions = Array.from(requesterSet).sort((a, b) => a.localeCompare(b));
+
+    const html = `
+      <div class="section-header">
+        <h2>Audit Trail</h2>
+        <p>Review incoming remote requests logged locally by the agent. Data stays on this machine.</p>
+      </div>
+
+      <div class="card">
+        <div class="field-grid">
+          <label style="grid-column: span 2;">
+            <span>Audit Log Path</span>
+            <input type="text" id="audit-log-path-input" value="${escapeHtml(state.runtime.auditLogPath)}" placeholder="~/.commands-agent/audit.log" />
+          </label>
+          <label>
+            <span>Search</span>
+            <input type="text" id="audit-search-input" value="${escapeHtml(state.audit.search)}" placeholder="keyword" />
+          </label>
+          <label>
+            <span>Requester UID</span>
+            <select id="audit-requester-select">
+              <option value="">All requesters</option>
+              ${requesterOptions.map((uid) => `
+                <option value="${escapeHtml(uid)}" ${uid === state.audit.requester ? 'selected' : ''}>${escapeHtml(uid)}</option>
+              `).join('')}
+            </select>
+          </label>
+          <label>
+            <span>Session ID</span>
+            <input type="text" id="audit-session-input" value="${escapeHtml(state.audit.sessionId)}" placeholder="sess_..." />
+          </label>
+          <label>
+            <span>Event</span>
+            <input type="text" id="audit-event-input" value="${escapeHtml(state.audit.event)}" placeholder="session.message.received" />
+          </label>
+          <label>
+            <span>From</span>
+            <input type="datetime-local" id="audit-from-input" value="${escapeHtml(state.audit.from)}" />
+          </label>
+          <label>
+            <span>To</span>
+            <input type="datetime-local" id="audit-to-input" value="${escapeHtml(state.audit.to)}" />
+          </label>
+          <label>
+            <span>Max Entries</span>
+            <input type="number" id="audit-limit-input" min="1" max="${MAX_AUDIT_LIMIT}" value="${escapeHtml(String(state.audit.limit))}" />
+          </label>
+          <div class="audit-view-toggle">
+            <span>View</span>
+            <label class="pill">
+              <input type="checkbox" id="audit-messages-only" ${state.audit.messagesOnly ? 'checked' : ''} />
+              Messages only
+            </label>
+          </div>
+        </div>
+        <div class="row runtime-actions audit-actions">
+          <button id="refresh-audit-btn" class="primary" ${auditUi.loading ? 'disabled' : ''}>${auditUi.loading ? 'Refreshing...' : 'Refresh Audit'}</button>
+          <button id="clear-audit-filters-btn">Clear Filters</button>
+          <button id="export-audit-btn" ${auditUi.entries.length === 0 ? 'disabled' : ''}>Export Filtered JSON</button>
+        </div>
+        <p id="audit-status" class="runtime-meta"></p>
+      </div>
+
+      <div class="card">
+        <div class="row">
+          <h3>Entries</h3>
+          <p id="audit-summary" class="meta"></p>
+        </div>
+        <div id="audit-entries" class="audit-entries"></div>
+      </div>
+    `;
+
+    el.panels[5].innerHTML = html;
+    wireAuditControls();
+    renderAuditEntriesDom();
+    if (!auditUi.loaded && !auditUi.loading) {
+      void refreshAuditTrail({ silent: true });
+    }
+  }
+
   function renderStep4PreviewOnly() {
     if (state.step === 4) {
       renderStep4();
@@ -1108,6 +1604,10 @@
     }
     if (state.step === 5) {
       renderStep5();
+      return;
+    }
+    if (state.step === 6) {
+      renderStep6();
     }
   }
 
@@ -1122,11 +1622,12 @@
     renderStep3();
     renderStep4();
     renderStep5();
+    renderStep6();
   }
 
   function renderNav() {
     el.prev.disabled = state.step === 1;
-    el.next.textContent = state.step === 5 ? 'Done' : 'Next';
+    el.next.textContent = state.step === stepMeta.length ? 'Done' : 'Next';
   }
 
   function render() {
@@ -1151,7 +1652,18 @@
         ...runtimeUi.status,
         ...payload
       };
+      const launchConfig = payload.launchConfig && typeof payload.launchConfig === 'object'
+        ? payload.launchConfig
+        : null;
+      if (launchConfig && typeof launchConfig.auditLogPath === 'string' && launchConfig.auditLogPath.trim()) {
+        const nextAuditLogPath = launchConfig.auditLogPath.trim();
+        if (state.runtime.auditLogPath !== nextAuditLogPath) {
+          state.runtime.auditLogPath = nextAuditLogPath;
+          persist();
+        }
+      }
       updateRuntimeStatusDom();
+      renderAuditEntriesDom();
     });
 
     if (window.commandsDesktop.getAgentStatus) {
@@ -1161,7 +1673,15 @@
             ...runtimeUi.status,
             ...result.status
           };
+          const launchConfig = result.status.launchConfig && typeof result.status.launchConfig === 'object'
+            ? result.status.launchConfig
+            : null;
+          if (launchConfig && typeof launchConfig.auditLogPath === 'string' && launchConfig.auditLogPath.trim()) {
+            state.runtime.auditLogPath = launchConfig.auditLogPath.trim();
+            persist();
+          }
           updateRuntimeStatusDom();
+          renderAuditEntriesDom();
         }
       }).catch((err) => {
         appendRuntimeLog('system', `[desktop] failed to read initial status: ${err instanceof Error ? err.message : String(err)}`);
@@ -1178,7 +1698,7 @@
 
   el.prev.addEventListener('click', () => setStep(state.step - 1));
   el.next.addEventListener('click', () => {
-    if (state.step < 5) {
+    if (state.step < stepMeta.length) {
       setStep(state.step + 1);
     }
   });
@@ -1190,7 +1710,14 @@
     state.profiles = fresh.profiles;
     state.mcp = fresh.mcp;
     state.runtime = fresh.runtime;
+    state.audit = fresh.audit;
     runtimeUi.logs = [];
+    auditUi.loaded = false;
+    auditUi.loading = false;
+    auditUi.error = '';
+    auditUi.entries = [];
+    auditUi.summary = null;
+    auditUi.lastLoadedAt = '';
     persist();
     render();
   });

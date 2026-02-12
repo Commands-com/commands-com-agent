@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld('commandsDesktop', {
   saveJson: (payload) => ipcRenderer.invoke('desktop:save-json', payload),
   openUrl: (url) => ipcRenderer.invoke('desktop:open-url', url),
   pickDirectory: (payload) => ipcRenderer.invoke('desktop:pick-directory', payload),
+  readAuditLog: (payload) => ipcRenderer.invoke('desktop:audit:read', payload),
   startAgent: (payload) => ipcRenderer.invoke('desktop:agent:start', payload),
   stopAgent: (payload) => ipcRenderer.invoke('desktop:agent:stop', payload),
   getAgentStatus: () => ipcRenderer.invoke('desktop:agent:status'),

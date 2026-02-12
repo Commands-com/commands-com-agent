@@ -3,13 +3,14 @@
 Local-first setup and control companion for Commands agents.
 
 This desktop app provides:
-- local agent setup wizard (multi-profile, 5-step flow)
+- local agent setup wizard (multi-profile, 6-step flow)
 - MCP module selection with deploy/config options
 - scheduler configuration per profile
 - run-and-validate step before final review
 - export of setup JSON for gateway/agent integration
 - one-click bootstrap command copy for first run
 - direct Start/Stop controls for local `./start-agent.sh` with live logs
+- local audit trail review with filters and JSON export
 
 ## Run
 
