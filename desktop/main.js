@@ -22,7 +22,7 @@ function createWindow() {
     minWidth: 1100,
     minHeight: 760,
     title: 'Commands.com Desktop',
-    backgroundColor: '#0b1220',
+    backgroundColor: '#0c1017',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
