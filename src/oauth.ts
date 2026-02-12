@@ -201,6 +201,41 @@ async function exchangeRefreshToken(params: OAuthRefreshOptions): Promise<OAuthT
   };
 }
 
+function callbackPage(title: string, message: string, success: boolean): string {
+  const color = success ? '#10b981' : '#ef4444';
+  const icon = success
+    ? '<circle cx="20" cy="20" r="20" fill="#10b981"/><path d="M13 20l4 4 10-10" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>'
+    : '<circle cx="20" cy="20" r="20" fill="#ef4444"/><path d="M14 14l12 12M26 14l-12 12" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>';
+  return `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Commands.com - ${title}</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:'Inter',system-ui,-apple-system,sans-serif;background:#0c1017;color:#e5e7eb;
+display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{max-width:420px;width:100%;background:#131923;border:1px solid rgba(55,65,81,0.4);
+border-radius:14px;padding:40px;text-align:center}
+.logo{margin-bottom:28px}
+.icon{margin-bottom:20px}
+h2{margin:0 0 8px;font-size:20px;font-weight:600;color:${color}}
+p{margin:0;color:#94a3b8;font-size:14px;line-height:1.5}
+.hint{margin-top:20px;padding-top:16px;border-top:1px solid rgba(55,65,81,0.4);font-size:12px;color:#64748b}
+</style></head><body>
+<div class="card">
+<div class="logo">
+<svg viewBox="0 0 32 32" width="36" height="36" xmlns="http://www.w3.org/2000/svg">
+<rect x="1" y="1" width="30" height="30" rx="4" fill="#121929" stroke="#51A2FF" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<polyline points="9 10 16 16 9 22" fill="none" stroke="#51A2FF" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="21" y="8" width="2" height="16" fill="#51A2FF"/>
+</svg>
+</div>
+<div class="icon"><svg width="40" height="40" viewBox="0 0 40 40">${icon}</svg></div>
+<h2>${title}</h2>
+<p>${message}</p>
+<div class="hint">You can close this tab and return to your terminal.</div>
+</div></body></html>`;
+}
+
 async function startLocalCallback(params: {
   expectedState: string;
   timeoutMs: number;
@@ -234,7 +269,7 @@ async function startLocalCallback(params: {
     if (error) {
       res.statusCode = 400;
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.end('<h3>Authorization failed. Return to terminal.</h3>');
+      res.end(callbackPage('Authorization Failed', 'An error occurred during sign-in. Please try again from your terminal.', false));
       rejectCode(new Error(`oauth_error_${error}`));
       return;
     }
@@ -242,7 +277,7 @@ async function startLocalCallback(params: {
     if (state !== params.expectedState) {
       res.statusCode = 400;
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.end('<h3>Invalid OAuth state. Return to terminal.</h3>');
+      res.end(callbackPage('Invalid Request', 'The authorization state did not match. Please try again from your terminal.', false));
       rejectCode(new Error('oauth_state_mismatch'));
       return;
     }
@@ -250,14 +285,14 @@ async function startLocalCallback(params: {
     if (!code) {
       res.statusCode = 400;
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.end('<h3>Missing authorization code. Return to terminal.</h3>');
+      res.end(callbackPage('Missing Code', 'No authorization code was received. Please try again from your terminal.', false));
       rejectCode(new Error('oauth_missing_code'));
       return;
     }
 
     res.statusCode = 200;
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.end('<h3>Authorization complete. You can close this tab and return to terminal.</h3>');
+    res.end(callbackPage('Agent Registered', 'Your agent has been successfully connected to your Commands.com account.', true));
     resolveCode(code);
   });
 

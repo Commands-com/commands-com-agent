@@ -8,7 +8,7 @@ GATEWAY_URL="${GATEWAY_URL:-http://localhost:8091}"
 DEVICE_ID="${DEVICE_ID:-}"
 DEVICE_NAME="${DEVICE_NAME:-}"
 DEVICE_TOKEN="${DEVICE_TOKEN:-}"
-MODEL="${MODEL:-claude-sonnet-4-5-20250929}"
+MODEL="${MODEL:-sonnet}"
 DEFAULT_CWD="${DEFAULT_CWD:-/Users/dtannen/Code/commands-com-app}"
 HEARTBEAT_MS="${HEARTBEAT_MS:-5000}"
 AUDIT_LOG_PATH="${AUDIT_LOG_PATH:-$HOME/.commands-agent/audit.log}"
@@ -94,10 +94,11 @@ echo "[agent] starting runtime"
 if [[ "$INIT_AGENT" == "0" ]]; then
   echo "[agent] using existing config at $CONFIG_FILE (skip init/login)"
 fi
-echo "[agent] gateway=$GATEWAY_URL cwd=$DEFAULT_CWD heartbeat_ms=$HEARTBEAT_MS auth_mode=$AUTH_MODE init_agent=$INIT_AGENT audit_log=$AUDIT_LOG_PATH mcp_config=$MCP_CONFIG"
+echo "[agent] gateway=$GATEWAY_URL model=$MODEL cwd=$DEFAULT_CWD heartbeat_ms=$HEARTBEAT_MS auth_mode=$AUTH_MODE init_agent=$INIT_AGENT audit_log=$AUDIT_LOG_PATH mcp_config=$MCP_CONFIG"
 
 exec node dist/index.js start \
   --default-cwd "$DEFAULT_CWD" \
   --heartbeat-ms "$HEARTBEAT_MS" \
   --audit-log-path "$AUDIT_LOG_PATH" \
+  --model "$MODEL" \
   --mcp-config "$MCP_CONFIG"

@@ -34,6 +34,49 @@ type StreamMessage = {
   model?: string;
 };
 
+function normalizeModelForSdk(model: string): string {
+  const normalized = model.trim().toLowerCase();
+  if (!normalized) {
+    return 'sonnet';
+  }
+
+  if (normalized === 'sonnet' || normalized === 'opus' || normalized === 'haiku' || normalized === 'inherit') {
+    return normalized;
+  }
+
+  if (normalized.startsWith('claude-sonnet')) {
+    return 'sonnet';
+  }
+
+  if (normalized.startsWith('claude-opus')) {
+    return 'opus';
+  }
+
+  if (normalized.startsWith('claude-haiku')) {
+    return 'haiku';
+  }
+
+  return model;
+}
+
+function modelFamily(model: string | undefined): string | undefined {
+  if (!model) {
+    return undefined;
+  }
+
+  const normalized = model.toLowerCase();
+  if (normalized.includes('opus')) {
+    return 'opus';
+  }
+  if (normalized.includes('sonnet')) {
+    return 'sonnet';
+  }
+  if (normalized.includes('haiku')) {
+    return 'haiku';
+  }
+  return undefined;
+}
+
 function extractAssistantText(message: StreamMessage): string {
   const content = message.message?.content;
   if (typeof content === 'string') {
@@ -53,9 +96,16 @@ function extractAssistantText(message: StreamMessage): string {
 }
 
 export async function runPrompt(input: RunPromptInput): Promise<ClaudeRunResult> {
+  const requestedModel = input.model;
+  const sdkModel = normalizeModelForSdk(requestedModel);
+
+  if (sdkModel !== requestedModel) {
+    console.log(`[runtime] normalized model "${requestedModel}" -> "${sdkModel}" for SDK compatibility`);
+  }
+
   const options: NonNullable<Parameters<typeof query>[0]['options']> = {
     cwd: input.cwd,
-    model: input.model,
+    model: sdkModel,
     maxTurns: input.maxTurns ?? 40,
   };
 
@@ -165,6 +215,12 @@ export async function runPrompt(input: RunPromptInput): Promise<ClaudeRunResult>
 
   if (!finalResult) {
     finalResult = latestAssistant;
+  }
+
+  const requestedFamily = modelFamily(sdkModel);
+  const actualFamily = modelFamily(detectedModel);
+  if (requestedFamily && actualFamily && requestedFamily !== actualFamily) {
+    console.log(`[runtime] warning: model mismatch requested=${sdkModel} actual=${detectedModel}`);
   }
 
   return {

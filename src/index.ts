@@ -158,7 +158,7 @@ Examples:
 
 async function cmdLogin(flags: Map<string, string>): Promise<void> {
   const gatewayUrl = normalizeGatewayUrl(optional(flags, 'gateway-url', 'https://commands.com'));
-  const model = optional(flags, 'model', 'claude-sonnet-4-5-20250929');
+  const model = optional(flags, 'model', 'sonnet');
   const scope = optional(flags, 'scope', 'read_assets write_assets offline_access');
   const clientId = optional(flags, 'client-id', 'commands-agent');
   const timeoutSeconds = parseIntStrict(optional(flags, 'timeout-seconds', '300'), 'timeout-seconds');
@@ -244,7 +244,7 @@ async function cmdInit(flags: Map<string, string>): Promise<void> {
   const gatewayUrl = normalizeGatewayUrl(optional(flags, 'gateway-url', 'https://commands.com'));
   const deviceId = required(flags, 'device-id');
   const deviceToken = required(flags, 'device-token');
-  const model = optional(flags, 'model', 'claude-sonnet-4-5-20250929');
+  const model = optional(flags, 'model', 'sonnet');
 
   const mcpServers = await resolveMcpServers(flags, undefined);
   const identity = generateIdentity();
@@ -387,6 +387,8 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
   const reconnectMinMs = parseIntStrict(optional(flags, 'reconnect-min-ms', '1000'), 'reconnect-min-ms');
   const reconnectMaxMs = parseIntStrict(optional(flags, 'reconnect-max-ms', '30000'), 'reconnect-max-ms');
   const auditLogPath = optional(flags, 'audit-log-path', path.join(CONFIG_DIR, 'audit.log'));
+  const modelOverride = flags.get('model')?.trim();
+  const selectedModel = modelOverride && modelOverride.length > 0 ? modelOverride : config.model;
 
   if (reconnectMinMs > reconnectMaxMs) {
     throw new Error('reconnect-min-ms cannot be greater than reconnect-max-ms');
@@ -395,8 +397,15 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
   const mcpServers = await resolveMcpServers(flags, config.mcpServers);
   const effectiveConfig: AgentConfig = {
     ...config,
+    model: selectedModel,
     ...(mcpServers ? { mcpServers } : {}),
   };
+
+  if (effectiveConfig.model !== config.model) {
+    console.log(`[runtime] model override: ${effectiveConfig.model} (was ${config.model})`);
+    await saveConfig(effectiveConfig);
+    console.log('[runtime] saved updated model to local config');
+  }
 
   const preflight = await registerIdentityKey(
     effectiveConfig.gatewayUrl,
@@ -501,6 +510,7 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
 
   console.log('[runtime] starting commands-agent websocket runtime');
   console.log(`[runtime] gateway=${effectiveConfig.gatewayUrl} device=${effectiveConfig.deviceId}`);
+  console.log(`[runtime] model=${effectiveConfig.model}`);
   console.log(`[runtime] default-cwd=${defaultCwd}`);
   console.log(`[runtime] audit-log=${auditLogPath}`);
   console.log(`[runtime] mcp-servers=${describeMcpServers(effectiveConfig.mcpServers)}`);
