@@ -1,15 +1,24 @@
 #!/usr/bin/env node
 
 import crypto from 'node:crypto';
+import os from 'node:os';
+import path from 'node:path';
 import process from 'node:process';
-import { CONFIG_PATH, normalizeGatewayUrl, requireConfig, saveConfig } from './config.js';
+import {
+  CONFIG_DIR,
+  CONFIG_PATH,
+  loadConfig,
+  normalizeGatewayUrl,
+  requireConfig,
+  saveConfig,
+} from './config.js';
 import { generateIdentity, shortFingerprint } from './crypto.js';
 import { runPrompt } from './claude.js';
 import { gatewayHealth, registerIdentityKey } from './gateway.js';
 import { acknowledgeHandshake } from './handshake.js';
 import { startRuntime } from './runtime.js';
 import { describeMcpServers, loadMcpServersFromFile } from './mcp.js';
-import { runGatewayOAuthLogin } from './oauth.js';
+import { refreshGatewayOAuthToken, runGatewayOAuthLogin } from './oauth.js';
 import type { AgentConfig, AgentMcpServers } from './types.js';
 
 type ParsedArgs = {
@@ -72,6 +81,28 @@ function parseIntStrict(value: string, fieldName: string): number {
   return Math.floor(parsed);
 }
 
+function sanitizeDeviceSegment(value: string, maxLength: number): string {
+  const normalized = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .replace(/-+/g, '-');
+  if (!normalized) {
+    return '';
+  }
+  return normalized.slice(0, maxLength).replace(/-+$/g, '');
+}
+
+function isInvalidJWTError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return normalized.includes('invalid jwt token') || normalized.includes('failed to parse token');
+}
+
+function isRefreshTokenMissingError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return normalized.includes('refresh token not found or expired');
+}
+
 async function resolveMcpServers(
   flags: Map<string, string>,
   fallback: AgentMcpServers | undefined
@@ -84,8 +115,22 @@ async function resolveMcpServers(
   return loadMcpServersFromFile(mcpConfigPath);
 }
 
-function generatedDeviceID(userID?: string): string {
-  const userPart = (userID ?? 'user').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 12) || 'user';
+function generatedDeviceID(userID?: string, deviceName?: string): string {
+  if (deviceName) {
+    const namedPart = sanitizeDeviceSegment(deviceName, 32);
+    if (!namedPart) {
+      throw new Error('device name must include letters or numbers');
+    }
+    return `dev-${namedPart}`;
+  }
+
+  const hostPart = sanitizeDeviceSegment(os.hostname(), 18);
+  const userPart = sanitizeDeviceSegment(userID ?? 'user', 12) || 'user';
+
+  if (hostPart) {
+    return `dev-${hostPart}-${userPart}`;
+  }
+
   const suffix = crypto.randomBytes(4).toString('hex');
   return `dev-${userPart}-${suffix}`;
 }
@@ -103,10 +148,11 @@ Commands:
 
 Examples:
   commands-agent login --gateway-url https://commands.com
+  commands-agent login --gateway-url https://commands.com --device-name "office-mac"
   commands-agent login --gateway-url https://commands.com --headless
   commands-agent init --gateway-url https://commands.com --device-id dev_123 --device-token <token>
   commands-agent run --prompt "Summarize this repository" --cwd /Users/me/Code/app
-  commands-agent start --default-cwd /Users/me/Code --heartbeat-ms 15000
+  commands-agent start --default-cwd /Users/me/Code --heartbeat-ms 15000 --audit-log-path ~/.commands-agent/audit.log
 `);
 }
 
@@ -131,8 +177,22 @@ async function cmdLogin(flags: Map<string, string>): Promise<void> {
     openBrowser,
   });
 
-  const deviceId = optional(flags, 'device-id', generatedDeviceID(oauth.userID));
-  const identity = generateIdentity();
+  const requestedDeviceID = flags.get('device-id')?.trim();
+  const requestedDeviceName = flags.get('device-name')?.trim();
+  if (requestedDeviceID && requestedDeviceName) {
+    throw new Error('use either --device-id or --device-name, not both');
+  }
+  const namedDeviceID = requestedDeviceName ? generatedDeviceID(oauth.userID, requestedDeviceName) : '';
+  const existing = await loadConfig();
+  const canReuseExisting =
+    !!existing &&
+    normalizeGatewayUrl(existing.gatewayUrl) === gatewayUrl &&
+    !!existing.deviceId &&
+    (!oauth.userID || !existing.ownerUID || existing.ownerUID === oauth.userID);
+
+  const reusingExistingDevice = !requestedDeviceID && !namedDeviceID && canReuseExisting;
+  const deviceId = requestedDeviceID || namedDeviceID || (reusingExistingDevice ? existing.deviceId : generatedDeviceID(oauth.userID));
+  const identity = reusingExistingDevice ? existing.identity : generateIdentity();
 
   const expiresAt = new Date(Date.now() + oauth.expiresIn * 1000).toISOString();
 
@@ -153,6 +213,11 @@ async function cmdLogin(flags: Map<string, string>): Promise<void> {
 
   await saveConfig(config);
   console.log(`Saved config: ${CONFIG_PATH}`);
+  if (reusingExistingDevice) {
+    console.log(`[auth] reusing existing device id: ${deviceId}`);
+  } else if (namedDeviceID) {
+    console.log(`[auth] using named device id: ${deviceId}`);
+  }
 
   if (mcpServers) {
     console.log(`Configured MCP servers: ${describeMcpServers(mcpServers)}`);
@@ -321,6 +386,7 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
   const heartbeatMs = parseIntStrict(optional(flags, 'heartbeat-ms', '15000'), 'heartbeat-ms');
   const reconnectMinMs = parseIntStrict(optional(flags, 'reconnect-min-ms', '1000'), 'reconnect-min-ms');
   const reconnectMaxMs = parseIntStrict(optional(flags, 'reconnect-max-ms', '30000'), 'reconnect-max-ms');
+  const auditLogPath = optional(flags, 'audit-log-path', path.join(CONFIG_DIR, 'audit.log'));
 
   if (reconnectMinMs > reconnectMaxMs) {
     throw new Error('reconnect-min-ms cannot be greater than reconnect-max-ms');
@@ -331,6 +397,97 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
     ...config,
     ...(mcpServers ? { mcpServers } : {}),
   };
+
+  const preflight = await registerIdentityKey(
+    effectiveConfig.gatewayUrl,
+    effectiveConfig.deviceId,
+    effectiveConfig.deviceToken,
+    effectiveConfig.identity.publicKeyRawBase64
+  );
+
+  if (!preflight.ok) {
+    if (preflight.error && isInvalidJWTError(preflight.error)) {
+      if (!effectiveConfig.refreshToken) {
+        throw new Error('device token is invalid and no refresh token is available; run `INIT_AGENT=1 ./start-agent.sh` to re-authenticate');
+      }
+
+      console.log('[auth] access token rejected by gateway; attempting refresh token exchange');
+      try {
+        const refreshed = await refreshGatewayOAuthToken({
+          gatewayUrl: effectiveConfig.gatewayUrl,
+          refreshToken: effectiveConfig.refreshToken,
+          clientId: 'commands-agent',
+        });
+
+        effectiveConfig.deviceToken = refreshed.accessToken;
+        effectiveConfig.tokenExpiresAt = new Date(Date.now() + refreshed.expiresIn * 1000).toISOString();
+        if (refreshed.refreshToken) {
+          effectiveConfig.refreshToken = refreshed.refreshToken;
+        }
+        if (refreshed.scope) {
+          effectiveConfig.tokenScope = refreshed.scope;
+        }
+        if (refreshed.userID) {
+          effectiveConfig.ownerUID = refreshed.userID;
+        }
+        if (refreshed.email) {
+          effectiveConfig.ownerEmail = refreshed.email;
+        }
+
+        await saveConfig(effectiveConfig);
+        console.log('[auth] refreshed access token and updated local config');
+      } catch (refreshErr) {
+        const refreshMsg = refreshErr instanceof Error ? refreshErr.message : String(refreshErr);
+        if (!isRefreshTokenMissingError(refreshMsg)) {
+          throw refreshErr;
+        }
+
+        const headless = hasFlag(flags, 'headless');
+        const openBrowser = !headless && !hasFlag(flags, 'no-open-browser');
+        const oauthScope = effectiveConfig.tokenScope?.trim() || 'read_assets write_assets offline_access';
+
+        console.log('[auth] refresh token missing/expired; starting OAuth login to recover session');
+        const oauth = await runGatewayOAuthLogin({
+          gatewayUrl: effectiveConfig.gatewayUrl,
+          clientId: 'commands-agent',
+          scope: oauthScope,
+          timeoutMs: 300000,
+          headless,
+          openBrowser,
+        });
+
+        effectiveConfig.deviceToken = oauth.accessToken;
+        effectiveConfig.tokenExpiresAt = new Date(Date.now() + oauth.expiresIn * 1000).toISOString();
+        if (oauth.refreshToken) {
+          effectiveConfig.refreshToken = oauth.refreshToken;
+        }
+        if (oauth.scope) {
+          effectiveConfig.tokenScope = oauth.scope;
+        }
+        if (oauth.userID) {
+          effectiveConfig.ownerUID = oauth.userID;
+        }
+        if (oauth.email) {
+          effectiveConfig.ownerEmail = oauth.email;
+        }
+
+        await saveConfig(effectiveConfig);
+        console.log('[auth] re-authenticated and updated local config');
+      }
+
+      const retry = await registerIdentityKey(
+        effectiveConfig.gatewayUrl,
+        effectiveConfig.deviceId,
+        effectiveConfig.deviceToken,
+        effectiveConfig.identity.publicKeyRawBase64
+      );
+      if (!retry.ok) {
+        throw new Error(`identity registration failed after auth recovery: ${retry.error}`);
+      }
+    } else {
+      throw new Error(`identity registration failed: ${preflight.error}`);
+    }
+  }
 
   const controller = new AbortController();
 
@@ -345,6 +502,7 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
   console.log('[runtime] starting commands-agent websocket runtime');
   console.log(`[runtime] gateway=${effectiveConfig.gatewayUrl} device=${effectiveConfig.deviceId}`);
   console.log(`[runtime] default-cwd=${defaultCwd}`);
+  console.log(`[runtime] audit-log=${auditLogPath}`);
   console.log(`[runtime] mcp-servers=${describeMcpServers(effectiveConfig.mcpServers)}`);
   if (flags.get('mcp-config')) {
     console.log(`[runtime] using mcp config: ${flags.get('mcp-config')}`);
@@ -358,6 +516,7 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
         heartbeatMs,
         reconnectMinMs,
         reconnectMaxMs,
+        auditLogPath,
       },
       controller.signal
     );

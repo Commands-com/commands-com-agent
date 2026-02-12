@@ -26,11 +26,28 @@ npm install
 npm run build
 ```
 
+## Desktop Wizard (Electron)
+
+```bash
+# from repo root
+npm run dev:desktop
+
+# first run (installs desktop deps)
+npm install --prefix ./desktop
+npm run dev:desktop
+```
+
+The desktop app provides a local setup wizard for agent profiles, MCP modules, and scheduler presets.
+It can also start/stop the local agent process directly and stream runtime logs.
+
 ## Quickstart (OAuth, recommended)
 
 ```bash
 # Starts browser OAuth (Firebase), saves config, registers identity key, starts runtime
 ./start-agent.sh
+
+# Name your device (used to build a stable device_id like dev-office-mac)
+INIT_AGENT=1 DEVICE_NAME="office-mac" ./start-agent.sh
 
 # For production gateway
 GATEWAY_URL=https://commands.com ./start-agent.sh
@@ -41,6 +58,7 @@ Or run commands directly:
 ```bash
 node dist/index.js login \
   --gateway-url http://localhost:8091 \
+  --device-name "office-mac" \
   --mcp-config ./mcp-servers.json
 
 node dist/index.js start --default-cwd /Users/me/Code --heartbeat-ms 15000
@@ -65,6 +83,9 @@ node dist/index.js init \
 # Browser OAuth login + device registration
 node dist/index.js login --gateway-url http://localhost:8091
 
+# Browser OAuth login + custom device name
+node dist/index.js login --gateway-url http://localhost:8091 --device-name "office-mac"
+
 # Headless OAuth login (no auto-open browser)
 node dist/index.js login --gateway-url http://localhost:8091 --headless
 
@@ -79,6 +100,7 @@ node dist/index.js run --prompt "Summarize current TODOs" --cwd /path/to/repo
 node dist/index.js start \
   --default-cwd /Users/me/Code \
   --heartbeat-ms 15000 \
+  --audit-log-path ~/.commands-agent/audit.log \
   --reconnect-min-ms 1000 \
   --reconnect-max-ms 30000
 ```
@@ -91,6 +113,8 @@ Environment variables:
 - `AUTH_MODE=oauth|manual` (default `oauth`)
 - `HEADLESS=1` for headless OAuth login
 - `GATEWAY_URL`, `MODEL`, `DEFAULT_CWD`, `HEARTBEAT_MS`
+- `DEVICE_NAME` optional friendly name for OAuth login (`dev-<device_name_slug>`)
+- `AUDIT_LOG_PATH` local JSONL audit trail path (default `~/.commands-agent/audit.log`)
 - `MCP_CONFIG` (default `./mcp-servers.local.json`)
 - `MCP_FILESYSTEM_ROOT` (default `/Users/dtannen/Code`)
 - `DEVICE_ID`, `DEVICE_TOKEN` (required only in `AUTH_MODE=manual`)
@@ -153,6 +177,7 @@ When `session.message` includes encrypted fields (`ciphertext`, `nonce`, `tag`, 
 - Session keys are derived after handshake and kept in memory.
 - Nonce reuse is prevented via deterministic nonce + monotonic sequence.
 - MCP server permissions are the responsibility of the local operator; only trust servers you control.
+- Incoming session prompts are logged locally to the audit log path for owner review.
 
 ## Known gaps
 

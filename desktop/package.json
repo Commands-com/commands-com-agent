@@ -1,0 +1,14 @@
+{
+  "name": "commands-com-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Commands.com Desktop App - Local agent setup and control plane companion",
+  "main": "main.js",
+  "scripts": {
+    "dev": "NODE_OPTIONS= electron .",
+    "start": "NODE_OPTIONS= electron ."
+  },
+  "devDependencies": {
+    "electron": "^31.0.0"
+  }
+}

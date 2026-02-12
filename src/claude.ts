@@ -125,6 +125,11 @@ export async function runPrompt(input: RunPromptInput): Promise<ClaudeRunResult>
   let detectedModel: string | undefined;
   let detectedSessionId: string | undefined;
 
+  const userPrompt = input.prompt.trim();
+  if (userPrompt) {
+    console.log(`\n[user prompt]\n${userPrompt}\n`);
+  }
+
   for await (const raw of query({ prompt: input.prompt, options })) {
     const message = raw as StreamMessage;
 

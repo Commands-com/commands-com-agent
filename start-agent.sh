@@ -6,17 +6,31 @@ cd "$ROOT_DIR"
 
 GATEWAY_URL="${GATEWAY_URL:-http://localhost:8091}"
 DEVICE_ID="${DEVICE_ID:-}"
+DEVICE_NAME="${DEVICE_NAME:-}"
 DEVICE_TOKEN="${DEVICE_TOKEN:-}"
 MODEL="${MODEL:-claude-sonnet-4-5-20250929}"
 DEFAULT_CWD="${DEFAULT_CWD:-/Users/dtannen/Code/commands-com-app}"
 HEARTBEAT_MS="${HEARTBEAT_MS:-5000}"
+AUDIT_LOG_PATH="${AUDIT_LOG_PATH:-$HOME/.commands-agent/audit.log}"
 DEFAULT_MCP_CONFIG_PATH="${ROOT_DIR}/mcp-servers.local.json"
 MCP_CONFIG="${MCP_CONFIG:-$DEFAULT_MCP_CONFIG_PATH}"
 MCP_FILESYSTEM_ROOT="${MCP_FILESYSTEM_ROOT:-/Users/dtannen/Code}"
 AUTH_MODE="${AUTH_MODE:-oauth}" # oauth | manual
 HEADLESS="${HEADLESS:-0}"
 BUILD_AGENT="${BUILD_AGENT:-1}"
-INIT_AGENT="${INIT_AGENT:-1}"
+INIT_AGENT="${INIT_AGENT:-auto}" # auto | 0 | 1
+CONFIG_FILE="${CONFIG_FILE:-$HOME/.commands-agent/config.json}"
+
+if [[ "$INIT_AGENT" == "auto" ]]; then
+  if [[ -f "$CONFIG_FILE" ]]; then
+    INIT_AGENT="0"
+  else
+    INIT_AGENT="1"
+  fi
+fi
+
+# DEVICE_NAME is applied during init/login only. If INIT_AGENT resolves to 0,
+# we keep the existing registered identity and skip re-auth as expected.
 
 if [[ ! -f "$MCP_CONFIG" ]]; then
   echo "[agent] creating default MCP config at $MCP_CONFIG"
@@ -51,6 +65,9 @@ if [[ "$INIT_AGENT" == "1" ]]; then
     if [[ -n "$DEVICE_ID" ]]; then
       LOGIN_ARGS+=(--device-id "$DEVICE_ID")
     fi
+    if [[ -n "$DEVICE_NAME" ]]; then
+      LOGIN_ARGS+=(--device-name "$DEVICE_NAME")
+    fi
 
     if [[ "$HEADLESS" == "1" ]]; then
       LOGIN_ARGS+=(--headless)
@@ -74,9 +91,13 @@ if [[ "$INIT_AGENT" == "1" ]]; then
 fi
 
 echo "[agent] starting runtime"
-echo "[agent] gateway=$GATEWAY_URL cwd=$DEFAULT_CWD heartbeat_ms=$HEARTBEAT_MS auth_mode=$AUTH_MODE mcp_config=$MCP_CONFIG"
+if [[ "$INIT_AGENT" == "0" ]]; then
+  echo "[agent] using existing config at $CONFIG_FILE (skip init/login)"
+fi
+echo "[agent] gateway=$GATEWAY_URL cwd=$DEFAULT_CWD heartbeat_ms=$HEARTBEAT_MS auth_mode=$AUTH_MODE init_agent=$INIT_AGENT audit_log=$AUDIT_LOG_PATH mcp_config=$MCP_CONFIG"
 
-node dist/index.js start \
+exec node dist/index.js start \
   --default-cwd "$DEFAULT_CWD" \
   --heartbeat-ms "$HEARTBEAT_MS" \
+  --audit-log-path "$AUDIT_LOG_PATH" \
   --mcp-config "$MCP_CONFIG"

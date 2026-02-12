@@ -6,6 +6,7 @@ import {
   encryptFramePayload,
   type FrameDirection,
 } from './crypto.js';
+import { appendAuditEvent } from './audit.js';
 import { registerIdentityKey } from './gateway.js';
 import { acknowledgeHandshake } from './handshake.js';
 import { runPrompt } from './claude.js';
@@ -13,8 +14,9 @@ import { runPrompt } from './claude.js';
 export interface RuntimeOptions {
   defaultCwd: string;
   heartbeatMs: number;
-  reconnectMinMs?: number;
-  reconnectMaxMs?: number;
+  reconnectMinMs: number;
+  reconnectMaxMs: number;
+  auditLogPath: string;
 }
 
 interface RuntimeSession {
@@ -132,7 +134,7 @@ class AgentRuntime {
 
   constructor(
     private readonly config: AgentConfig,
-    private readonly options: Required<RuntimeOptions>,
+    private readonly options: RuntimeOptions,
     private readonly signal: AbortSignal
   ) {
     this.backoffMs = options.reconnectMinMs;
@@ -347,6 +349,18 @@ class AgentRuntime {
     }
 
     try {
+      // Re-register the long-lived identity key just before each handshake.
+      // This makes handshake ACK robust if gateway in-memory state was reset.
+      const identityReg = await registerIdentityKey(
+        this.config.gatewayUrl,
+        this.config.deviceId,
+        this.config.deviceToken,
+        this.config.identity.publicKeyRawBase64
+      );
+      if (!identityReg.ok) {
+        throw new Error(`identity registration failed before handshake ack: ${identityReg.error}`);
+      }
+
       const ack = await acknowledgeHandshake(this.config, {
         sessionId,
         handshakeId,
@@ -475,6 +489,8 @@ class AgentRuntime {
     let encryptedRequest = false;
     let prompt: string | null;
     let cwd: string;
+    const requesterUID = firstString(frame.requester_uid, frame.requesterUid, frame.user_id, frame.userId) ?? 'unknown';
+    const receivedAt = firstString(frame.received_at, frame.receivedAt) ?? new Date().toISOString();
 
     if (hasEncryptedFields) {
       encryptedRequest = true;
@@ -617,6 +633,25 @@ class AgentRuntime {
       return;
     }
 
+    try {
+      await appendAuditEvent(this.options.auditLogPath, {
+        at: new Date().toISOString(),
+        event: 'session.message.received',
+        received_at: receivedAt,
+        requester_uid: requesterUID,
+        device_id: this.config.deviceId,
+        session_id: sessionId,
+        handshake_id: session.handshakeId,
+        message_id: messageId,
+        cwd,
+        encrypted: encryptedRequest,
+        prompt,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.log(`[runtime] audit log write failed: ${msg}`);
+    }
+
     sendJson(ws, {
       type: 'session.progress',
       session_id: sessionId,
@@ -697,11 +732,12 @@ export async function startRuntime(
   options: RuntimeOptions,
   signal: AbortSignal
 ): Promise<void> {
-  const normalizedOptions: Required<RuntimeOptions> = {
+  const normalizedOptions: RuntimeOptions = {
     defaultCwd: options.defaultCwd,
     heartbeatMs: options.heartbeatMs,
     reconnectMinMs: options.reconnectMinMs ?? 1000,
     reconnectMaxMs: options.reconnectMaxMs ?? 30000,
+    auditLogPath: options.auditLogPath,
   };
 
   const runtime = new AgentRuntime(config, normalizedOptions, signal);

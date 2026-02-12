@@ -13,6 +13,12 @@ interface OAuthTokenResponse {
   refresh_token?: string;
 }
 
+export interface OAuthRefreshOptions {
+  gatewayUrl: string;
+  refreshToken: string;
+  clientId?: string;
+}
+
 export interface OAuthLoginOptions {
   gatewayUrl: string;
   clientId: string;
@@ -137,6 +143,53 @@ async function exchangeCodeForToken(params: {
   const data = parsed as Partial<OAuthTokenResponse>;
   if (!data.access_token || typeof data.expires_in !== 'number') {
     throw new Error('token_exchange_invalid_response');
+  }
+
+  return {
+    access_token: data.access_token,
+    token_type: data.token_type ?? 'Bearer',
+    expires_in: data.expires_in,
+    scope: data.scope,
+    refresh_token: data.refresh_token,
+  };
+}
+
+async function exchangeRefreshToken(params: OAuthRefreshOptions): Promise<OAuthTokenResponse> {
+  const form = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: params.refreshToken,
+  });
+  if (params.clientId) {
+    form.set('client_id', params.clientId);
+  }
+
+  const resp = await fetch(`${params.gatewayUrl}/oauth/token`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json',
+    },
+    body: form.toString(),
+  });
+
+  const text = await resp.text();
+  let parsed: unknown;
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch {
+    parsed = text;
+  }
+
+  if (!resp.ok) {
+    const errorText = typeof parsed === 'object' && parsed !== null
+      ? (parsed as { error_description?: string; error?: string }).error_description ?? (parsed as { error?: string }).error
+      : undefined;
+    throw new Error(errorText ?? `refresh_token_exchange_failed_http_${resp.status}`);
+  }
+
+  const data = parsed as Partial<OAuthTokenResponse>;
+  if (!data.access_token || typeof data.expires_in !== 'number') {
+    throw new Error('refresh_token_exchange_invalid_response');
   }
 
   return {
@@ -332,6 +385,21 @@ export async function runGatewayOAuthLogin(options: OAuthLoginOptions): Promise<
     codeVerifier,
   });
 
+  const claims = parseJwtPayload(tokenResp.access_token);
+
+  return {
+    accessToken: tokenResp.access_token,
+    refreshToken: tokenResp.refresh_token,
+    scope: tokenResp.scope,
+    expiresIn: tokenResp.expires_in,
+    userID: claims.sub,
+    email: claims.email,
+    name: claims.name,
+  };
+}
+
+export async function refreshGatewayOAuthToken(options: OAuthRefreshOptions): Promise<OAuthLoginResult> {
+  const tokenResp = await exchangeRefreshToken(options);
   const claims = parseJwtPayload(tokenResp.access_token);
 
   return {
