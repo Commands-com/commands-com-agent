@@ -1,6 +1,6 @@
 (function () {
   const STORAGE_KEY = 'commands.desktop.setupWizard.v1';
-  const DEFAULT_GATEWAY_URL = 'http://localhost:8091';
+  const DEFAULT_GATEWAY_URL = 'https://api.commands.com';
   const MAX_RUNTIME_LOG_LINES = 600;
   const DEFAULT_AUDIT_LIMIT = 200;
   const MAX_AUDIT_LIMIT = 2000;
@@ -21,14 +21,6 @@
     { value: 'read-only', label: 'Read-Only' },
     { value: 'dev-safe', label: 'Dev Safe' },
     { value: 'full', label: 'Full Access' }
-  ];
-
-  const SCHEDULER_INTERVALS = [
-    { value: 'off', label: 'Disabled' },
-    { value: 'every-15m', label: 'Every 15 minutes' },
-    { value: 'hourly', label: 'Hourly' },
-    { value: 'daily-9am', label: 'Daily 9:00 AM' },
-    { value: 'custom', label: 'Custom CRON' }
   ];
 
   const MCP_CATALOG = [
@@ -83,10 +75,9 @@
   const stepMeta = [
     { id: 1, title: 'Agent Profiles' },
     { id: 2, title: 'MCP Modules' },
-    { id: 3, title: 'Scheduler' },
-    { id: 4, title: 'Run & Validate' },
-    { id: 5, title: 'Review' },
-    { id: 6, title: 'Audit Trail' }
+    { id: 3, title: 'Run & Validate' },
+    { id: 4, title: 'Review' },
+    { id: 5, title: 'Audit Trail' }
   ];
 
   const el = {
@@ -96,8 +87,7 @@
       document.getElementById('step-2'),
       document.getElementById('step-3'),
       document.getElementById('step-4'),
-      document.getElementById('step-5'),
-      document.getElementById('step-6')
+      document.getElementById('step-5')
     ],
     prev: document.getElementById('prev-step'),
     next: document.getElementById('next-step'),
@@ -155,13 +145,7 @@
       deviceName: `agent-${index}`,
       workspace: '/Users/you/Code',
       model: 'sonnet',
-      permissions: 'dev-safe',
-      scheduler: {
-        enabled: false,
-        interval: 'off',
-        customCron: '',
-        prompt: 'Summarize local code changes and list key risks.'
-      }
+      permissions: 'dev-safe'
     };
   }
 
@@ -230,15 +214,6 @@
       if (!profile.workspace) profile.workspace = '/Users/you/Code';
       if (!profile.model) profile.model = 'sonnet';
       if (!profile.permissions) profile.permissions = 'dev-safe';
-      if (!profile.scheduler || typeof profile.scheduler !== 'object') {
-        profile.scheduler = defaultProfile(i + 1).scheduler;
-      }
-      if (!profile.scheduler.interval) profile.scheduler.interval = 'off';
-      if (typeof profile.scheduler.enabled !== 'boolean') {
-        profile.scheduler.enabled = profile.scheduler.interval !== 'off';
-      }
-      if (!profile.scheduler.prompt) profile.scheduler.prompt = defaultProfile(i + 1).scheduler.prompt;
-      if (!profile.scheduler.customCron) profile.scheduler.customCron = '';
     });
 
     const runtimeRaw = raw.runtime && typeof raw.runtime === 'object' ? raw.runtime : {};
@@ -585,89 +560,6 @@
     });
   }
 
-  function renderStep3() {
-    const html = `
-      <div class="section-header">
-        <h2>Scheduler</h2>
-        <p>Configure recurring prompts. This should run through commands.com scheduler in production; this wizard generates deploy-ready settings.</p>
-      </div>
-      ${state.profiles.map((profile, idx) => `
-        <div class="card" data-scheduler-index="${idx}">
-          <div class="row">
-            <div>
-              <h3>${escapeHtml(profile.name)}</h3>
-              <p class="meta">Device: dev-${escapeHtml(slugify(profile.deviceName || profile.name) || `agent-${idx + 1}`)}</p>
-            </div>
-            <label class="pill">
-              <input type="checkbox" data-sched-field="enabled" ${profile.scheduler.enabled ? 'checked' : ''} />
-              Enabled
-            </label>
-          </div>
-          <div class="${profile.scheduler.enabled ? '' : 'hidden'}" data-sched-config>
-            <div class="field-grid">
-              <label>
-                <span>Interval</span>
-                <select data-sched-field="interval">
-                  ${SCHEDULER_INTERVALS.map((opt) => `<option value="${opt.value}" ${profile.scheduler.interval === opt.value ? 'selected' : ''}>${escapeHtml(opt.label)}</option>`).join('')}
-                </select>
-              </label>
-              <label>
-                <span>Custom CRON</span>
-                <input type="text" data-sched-field="customCron" value="${escapeHtml(profile.scheduler.customCron || '')}" ${profile.scheduler.interval === 'custom' ? '' : 'disabled'} />
-              </label>
-            </div>
-            <div class="field-grid one">
-              <label>
-                <span>Prompt</span>
-                <textarea rows="3" data-sched-field="prompt">${escapeHtml(profile.scheduler.prompt)}</textarea>
-              </label>
-            </div>
-          </div>
-        </div>
-      `).join('')}
-    `;
-
-    el.panels[2].innerHTML = html;
-
-    el.panels[2].querySelectorAll('[data-scheduler-index]').forEach((card) => {
-      const idx = Number(card.dataset.schedulerIndex);
-      const profile = state.profiles[idx];
-      if (!profile) return;
-
-      card.querySelectorAll('[data-sched-field]').forEach((input) => {
-        input.addEventListener('change', (event) => {
-          const field = event.target.dataset.schedField;
-          if (field === 'enabled') {
-            profile.scheduler.enabled = event.target.checked;
-            if (!profile.scheduler.enabled) {
-              profile.scheduler.interval = 'off';
-            } else if (profile.scheduler.interval === 'off') {
-              profile.scheduler.interval = 'hourly';
-            }
-            render();
-          } else if (field === 'interval') {
-            profile.scheduler.interval = event.target.value;
-            profile.scheduler.enabled = event.target.value !== 'off';
-            render();
-          } else {
-            profile.scheduler[field] = event.target.value;
-          }
-          renderStep4PreviewOnly();
-          persist();
-        });
-
-        input.addEventListener('input', (event) => {
-          const field = event.target.dataset.schedField;
-          if (field === 'customCron' || field === 'prompt') {
-            profile.scheduler[field] = event.target.value;
-            renderStep4PreviewOnly();
-            persist();
-          }
-        });
-      });
-    });
-  }
-
   function exportPayload() {
     const mcpModules = {};
     MCP_CATALOG.forEach((item) => {
@@ -691,15 +583,7 @@
         model: profile.model,
         permissions: profile.permissions
       })),
-      mcp_modules: mcpModules,
-      scheduler_jobs: state.profiles
-        .filter((profile) => profile.scheduler.enabled)
-        .map((profile) => ({
-          profile: profile.name,
-          interval: profile.scheduler.interval,
-          custom_cron: profile.scheduler.interval === 'custom' ? profile.scheduler.customCron : null,
-          prompt: profile.scheduler.prompt
-        }))
+      mcp_modules: mcpModules
     };
   }
 
@@ -1435,7 +1319,7 @@
       </div>
     `;
 
-    el.panels[3].innerHTML = html;
+    el.panels[2].innerHTML = html;
     wireRuntimeControls();
     updateRuntimeStatusDom();
     renderRuntimeLogs(true);
@@ -1457,7 +1341,6 @@
         <div class="summary-box summary-list">
           <p><strong>Profiles:</strong> ${payload.profiles.length}</p>
           <p><strong>Enabled MCP Modules:</strong> ${enabledMcpCount}</p>
-          <p><strong>Scheduled Jobs:</strong> ${payload.scheduler_jobs.length}</p>
           <p><strong>Primary Profile:</strong> ${escapeHtml(selectedProfile?.name || 'n/a')}</p>
           <p><strong>Primary Device:</strong> dev-${escapeHtml(slugify(selectedProfile?.deviceName || selectedProfile?.name) || 'n/a')}</p>
         </div>
@@ -1492,7 +1375,7 @@
       <div class="json-preview" id="json-preview">${escapeHtml(JSON.stringify(payload, null, 2))}</div>
     `;
 
-    el.panels[4].innerHTML = html;
+    el.panels[3].innerHTML = html;
 
     const copyBtn = document.getElementById('copy-command-review');
     if (copyBtn) {
@@ -1596,7 +1479,7 @@
       </div>
     `;
 
-    el.panels[5].innerHTML = html;
+    el.panels[4].innerHTML = html;
     wireAuditControls();
     renderAuditEntriesDom();
     if (!auditUi.loaded && !auditUi.loading) {
@@ -1605,15 +1488,15 @@
   }
 
   function renderStep4PreviewOnly() {
-    if (state.step === 4) {
+    if (state.step === 3) {
       renderStep4();
       return;
     }
-    if (state.step === 5) {
+    if (state.step === 4) {
       renderStep5();
       return;
     }
-    if (state.step === 6) {
+    if (state.step === 5) {
       renderStep6();
     }
   }
@@ -1626,7 +1509,6 @@
 
     renderStep1();
     renderStep2();
-    renderStep3();
     renderStep4();
     renderStep5();
     renderStep6();

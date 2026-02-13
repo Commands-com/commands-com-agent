@@ -4,14 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-GATEWAY_URL="${GATEWAY_URL:-http://localhost:8091}"
+GATEWAY_URL="${GATEWAY_URL:-https://api.commands.com}"
 DEVICE_ID="${DEVICE_ID:-}"
 DEVICE_NAME="${DEVICE_NAME:-}"
 DEVICE_TOKEN="${DEVICE_TOKEN:-}"
 MODEL="${MODEL:-sonnet}"
 PERMISSION_PROFILE="${PERMISSION_PROFILE:-dev-safe}"
-DEFAULT_CWD="${DEFAULT_CWD:-/Users/dtannen/Code/commands-com-app}"
-HEARTBEAT_MS="${HEARTBEAT_MS:-5000}"
+DEFAULT_CWD="${DEFAULT_CWD:-$HOME}"
+HEARTBEAT_MS="${HEARTBEAT_MS:-30000}"
 AUDIT_LOG_PATH="${AUDIT_LOG_PATH:-$HOME/.commands-agent/audit.log}"
 MCP_CONFIG_FROM_ENV=0
 if [[ -n "${MCP_CONFIG:-}" ]]; then
@@ -19,7 +19,7 @@ if [[ -n "${MCP_CONFIG:-}" ]]; then
 fi
 DEFAULT_MCP_CONFIG_PATH="${ROOT_DIR}/mcp-servers.local.json"
 MCP_CONFIG="${MCP_CONFIG:-$DEFAULT_MCP_CONFIG_PATH}"
-MCP_FILESYSTEM_ROOT="${MCP_FILESYSTEM_ROOT:-/Users/dtannen/Code}"
+MCP_FILESYSTEM_ROOT="${MCP_FILESYSTEM_ROOT:-$HOME}"
 MCP_FILESYSTEM_ENABLED="${MCP_FILESYSTEM_ENABLED:-1}"
 AUTH_MODE="${AUTH_MODE:-oauth}" # oauth | manual
 HEADLESS="${HEADLESS:-0}"

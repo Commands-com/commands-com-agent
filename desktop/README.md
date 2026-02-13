@@ -3,9 +3,8 @@
 Local-first setup and control companion for Commands agents.
 
 This desktop app provides:
-- local agent setup wizard (multi-profile, 6-step flow)
+- local agent setup wizard (multi-profile, 5-step flow)
 - MCP module selection with deploy/config options
-- scheduler configuration per profile
 - run-and-validate step before final review
 - export of setup JSON for gateway/agent integration
 - one-click bootstrap command copy for first run
@@ -15,7 +14,7 @@ This desktop app provides:
 ## Run
 
 ```bash
-cd /Users/dtannen/Code/commands-com-agent/desktop
+cd desktop
 npm install
 npm run dev
 ```

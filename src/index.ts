@@ -184,17 +184,17 @@ Commands:
   start           Start always-on websocket runtime with reconnect
 
 Examples:
-  commands-agent login --gateway-url https://commands.com
-  commands-agent login --gateway-url https://commands.com --device-name "office-mac"
-  commands-agent login --gateway-url https://commands.com --headless
-  commands-agent init --gateway-url https://commands.com --device-id dev_123 --device-token <token>
+  commands-agent login --gateway-url https://api.commands.com
+  commands-agent login --gateway-url https://api.commands.com --device-name "office-mac"
+  commands-agent login --gateway-url https://api.commands.com --headless
+  commands-agent init --gateway-url https://api.commands.com --device-id dev_123 --device-token <token>
   commands-agent run --prompt "Summarize this repository" --cwd /Users/me/Code/app --permission-profile read-only
   commands-agent start --default-cwd /Users/me/Code --heartbeat-ms 15000 --audit-log-path ~/.commands-agent/audit.log --permission-profile dev-safe
 `);
 }
 
 async function cmdLogin(flags: Map<string, string>): Promise<void> {
-  const gatewayUrl = normalizeGatewayUrl(optional(flags, 'gateway-url', 'https://commands.com'));
+  const gatewayUrl = normalizeGatewayUrl(optional(flags, 'gateway-url', 'https://api.commands.com'));
   const model = optional(flags, 'model', 'sonnet');
   const scope = optional(flags, 'scope', 'read_assets write_assets offline_access');
   const clientId = optional(flags, 'client-id', 'commands-agent');
@@ -282,7 +282,7 @@ async function cmdLogin(flags: Map<string, string>): Promise<void> {
 }
 
 async function cmdInit(flags: Map<string, string>): Promise<void> {
-  const gatewayUrl = normalizeGatewayUrl(optional(flags, 'gateway-url', 'https://commands.com'));
+  const gatewayUrl = normalizeGatewayUrl(optional(flags, 'gateway-url', 'https://api.commands.com'));
   const deviceId = required(flags, 'device-id');
   const deviceToken = required(flags, 'device-token');
   const model = optional(flags, 'model', 'sonnet');
