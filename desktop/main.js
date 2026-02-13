@@ -2,7 +2,7 @@ const path = require('node:path');
 const os = require('node:os');
 const fs = require('node:fs/promises');
 const { spawn } = require('node:child_process');
-const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, shell, safeStorage } = require('electron');
 const MAX_AUDIT_RETURN_ENTRIES = 2000;
 
 let agentProcess = null;
@@ -146,6 +146,180 @@ function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 
+// ---------------------------------------------------------------------------
+// Credential security — encrypt sensitive fields at rest via OS keychain
+// ---------------------------------------------------------------------------
+
+const SENSITIVE_FIELDS = ['deviceToken', 'refreshToken'];
+const SENSITIVE_NESTED = { identity: ['privateKeyDerBase64'] };
+const REDACTED_PLACEHOLDER = '[secured-by-desktop-app]';
+
+function getConfigDir() {
+  return path.join(os.homedir(), '.commands-agent');
+}
+
+function getConfigPath() {
+  return path.join(getConfigDir(), 'config.json');
+}
+
+function getCredentialsPath() {
+  return path.join(getConfigDir(), 'credentials.enc');
+}
+
+function extractSensitiveFields(config) {
+  const secrets = {};
+  for (const field of SENSITIVE_FIELDS) {
+    if (config[field] !== undefined && config[field] !== REDACTED_PLACEHOLDER) {
+      secrets[field] = config[field];
+    }
+  }
+  for (const [parent, children] of Object.entries(SENSITIVE_NESTED)) {
+    if (config[parent] && typeof config[parent] === 'object') {
+      for (const child of children) {
+        if (config[parent][child] !== undefined && config[parent][child] !== REDACTED_PLACEHOLDER) {
+          if (!secrets[parent]) secrets[parent] = {};
+          secrets[parent][child] = config[parent][child];
+        }
+      }
+    }
+  }
+  return secrets;
+}
+
+function redactConfig(config) {
+  const redacted = { ...config };
+  for (const field of SENSITIVE_FIELDS) {
+    if (redacted[field] !== undefined) {
+      redacted[field] = REDACTED_PLACEHOLDER;
+    }
+  }
+  for (const [parent, children] of Object.entries(SENSITIVE_NESTED)) {
+    if (redacted[parent] && typeof redacted[parent] === 'object') {
+      redacted[parent] = { ...redacted[parent] };
+      for (const child of children) {
+        if (redacted[parent][child] !== undefined) {
+          redacted[parent][child] = REDACTED_PLACEHOLDER;
+        }
+      }
+    }
+  }
+  redacted._credentialsSecured = true;
+  return redacted;
+}
+
+function mergeSecrets(config, secrets) {
+  const restored = { ...config };
+  for (const field of SENSITIVE_FIELDS) {
+    if (secrets[field] !== undefined) {
+      restored[field] = secrets[field];
+    }
+  }
+  for (const [parent, children] of Object.entries(SENSITIVE_NESTED)) {
+    if (secrets[parent] && typeof secrets[parent] === 'object') {
+      if (!restored[parent] || typeof restored[parent] !== 'object') {
+        restored[parent] = {};
+      } else {
+        restored[parent] = { ...restored[parent] };
+      }
+      for (const child of children) {
+        if (secrets[parent][child] !== undefined) {
+          restored[parent][child] = secrets[parent][child];
+        }
+      }
+    }
+  }
+  delete restored._credentialsSecured;
+  return restored;
+}
+
+async function secureCredentials() {
+  if (!safeStorage.isEncryptionAvailable()) {
+    emitAgentLog('system', '[desktop] safeStorage not available — credentials remain in plaintext');
+    return { ok: false, reason: 'safeStorage not available' };
+  }
+
+  const configPath = getConfigPath();
+  let raw;
+  try {
+    raw = await fs.readFile(configPath, 'utf8');
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return { ok: false, reason: 'no config file' };
+    throw err;
+  }
+
+  const config = JSON.parse(raw);
+  const secrets = extractSensitiveFields(config);
+
+  // Nothing to secure (already redacted or empty)
+  if (Object.keys(secrets).length === 0) {
+    return { ok: true, alreadySecured: true };
+  }
+
+  const encrypted = safeStorage.encryptString(JSON.stringify(secrets));
+  const credPath = getCredentialsPath();
+  await fs.writeFile(credPath, encrypted);
+  if (process.platform !== 'win32') {
+    await fs.chmod(credPath, 0o600);
+  }
+
+  const redacted = redactConfig(config);
+  await fs.writeFile(configPath, JSON.stringify(redacted, null, 2), 'utf8');
+
+  emitAgentLog('system', '[desktop] credentials encrypted and stored in OS keychain');
+  return { ok: true };
+}
+
+async function restoreCredentials() {
+  const configPath = getConfigPath();
+  const credPath = getCredentialsPath();
+
+  let raw;
+  try {
+    raw = await fs.readFile(configPath, 'utf8');
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return { ok: false, reason: 'no config file' };
+    throw err;
+  }
+
+  const config = JSON.parse(raw);
+  if (!config._credentialsSecured) {
+    return { ok: true, alreadyRestored: true };
+  }
+
+  if (!safeStorage.isEncryptionAvailable()) {
+    return { ok: false, reason: 'safeStorage not available — cannot decrypt credentials' };
+  }
+
+  let encryptedBuf;
+  try {
+    encryptedBuf = await fs.readFile(credPath);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      return { ok: false, reason: 'credentials.enc missing but config is marked as secured' };
+    }
+    throw err;
+  }
+
+  const decrypted = safeStorage.decryptString(encryptedBuf);
+  const secrets = JSON.parse(decrypted);
+  const restored = mergeSecrets(config, secrets);
+
+  await fs.writeFile(configPath, JSON.stringify(restored, null, 2), 'utf8');
+
+  emitAgentLog('system', '[desktop] credentials restored from OS keychain');
+  return { ok: true };
+}
+
+function areCredentialsSecured() {
+  try {
+    const raw = require('fs').readFileSync(getConfigPath(), 'utf8');
+    const config = JSON.parse(raw);
+    return Boolean(config._credentialsSecured);
+  } catch (_err) {
+    return false;
+  }
+}
+
 function buildAgentEnv(payload) {
   const env = { ...process.env };
   // Prevent inherited shell env from forcing external MCP config in desktop mode.
@@ -209,6 +383,22 @@ async function startAgent(payload = {}) {
     return {
       ok: false,
       error: `start script not found at ${scriptPath}`,
+      status: snapshotAgentState()
+    };
+  }
+
+  // Restore credentials from OS keychain before starting the agent
+  try {
+    const restoreResult = await restoreCredentials();
+    if (!restoreResult.ok && restoreResult.reason) {
+      emitAgentLog('system', `[desktop] credential restore: ${restoreResult.reason}`);
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    emitAgentLog('system', `[desktop] credential restore failed: ${msg}`);
+    return {
+      ok: false,
+      error: `failed to restore credentials: ${msg}`,
       status: snapshotAgentState()
     };
   }
@@ -278,6 +468,12 @@ async function startAgent(payload = {}) {
       `[desktop] agent exited code=${code == null ? 'null' : code} signal=${signal || 'none'}`
     );
     emitAgentStatus();
+
+    // Re-encrypt credentials now that agent has stopped
+    secureCredentials().catch((err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      emitAgentLog('system', `[desktop] credential secure after exit failed: ${msg}`);
+    });
   });
 
   return { ok: true, status: snapshotAgentState() };
@@ -519,7 +715,31 @@ ipcMain.handle('desktop:agent:start', async (_event, payload) => startAgent(payl
 ipcMain.handle('desktop:agent:stop', async (_event, payload) => stopAgent(Boolean(payload?.force)));
 ipcMain.handle('desktop:agent:status', async () => ({ ok: true, status: snapshotAgentState() }));
 
-app.whenReady().then(() => {
+ipcMain.handle('desktop:credentials:status', async () => ({
+  ok: true,
+  available: safeStorage.isEncryptionAvailable(),
+  secured: areCredentialsSecured()
+}));
+
+ipcMain.handle('desktop:credentials:secure', async () => {
+  try {
+    return await secureCredentials();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: msg };
+  }
+});
+
+app.whenReady().then(async () => {
+  // On startup, if credentials are in plaintext (e.g. after a crash), secure them.
+  if (safeStorage.isEncryptionAvailable() && !areCredentialsSecured()) {
+    try {
+      await secureCredentials();
+    } catch (_err) {
+      // Best-effort — app is starting
+    }
+  }
+
   createWindow();
   emitAgentStatus();
 
@@ -531,9 +751,16 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('before-quit', () => {
-  if (!agentProcess) return;
-  sendSignalToAgentProcess(agentProcess, 'SIGTERM');
+app.on('before-quit', async () => {
+  if (agentProcess) {
+    sendSignalToAgentProcess(agentProcess, 'SIGTERM');
+  }
+  // Ensure credentials are secured on quit regardless of agent state
+  try {
+    await secureCredentials();
+  } catch (_err) {
+    // Best-effort — app is closing
+  }
 });
 
 app.on('window-all-closed', () => {

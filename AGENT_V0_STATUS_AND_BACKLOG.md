@@ -89,7 +89,7 @@ Implemented:
 - Strict sequence enforcement (`nextIncomingSeq`, `nextOutgoingSeq`)
 - AAD support in encrypted envelopes
 - Encrypted `session.message` ingest path
-- Encrypted `session.result` and encrypted `session.error` response path
+- Encrypted `session.progress`, `session.result`, and `session.error` response paths (all session frames encrypted)
 
 Files:
 - `src/crypto.ts`
@@ -104,6 +104,7 @@ Implemented:
 - Automatic re-auth via OAuth when refresh token is also expired
 - Token expiry tracking in config
 - Cross-platform browser open (macOS, Windows, Linux)
+- Requests `device` scope for device-specific endpoint access
 
 Files:
 - `src/oauth.ts`

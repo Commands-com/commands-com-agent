@@ -23,5 +23,9 @@ contextBridge.exposeInMainWorld('commandsDesktop', {
   copyText: (text) => {
     clipboard.writeText(String(text || ''));
     return true;
+  },
+  credentialSecurity: {
+    getStatus: () => ipcRenderer.invoke('desktop:credentials:status'),
+    secure: () => ipcRenderer.invoke('desktop:credentials:secure')
   }
 });

@@ -652,12 +652,41 @@ class AgentRuntime {
       console.log(`[runtime] audit log write failed: ${msg}`);
     }
 
-    sendJson(ws, {
-      type: 'session.progress',
-      session_id: sessionId,
-      message_id: messageId,
-      status: 'running',
-    });
+    if (encryptedRequest) {
+      const seq = session.nextOutgoingSeq;
+      const direction: FrameDirection = 'agent_to_client';
+      const aad = buildAadBase64(sessionId, messageId, seq, direction);
+
+      const encryptedPayload = encryptFramePayload({
+        keyBase64: session.keys.agentToClientBase64,
+        direction,
+        seq,
+        plaintextUtf8: JSON.stringify({
+          status: 'running',
+          session_id: sessionId,
+          message_id: messageId,
+        }),
+        aadBase64: aad,
+      });
+
+      session.nextOutgoingSeq += 1;
+
+      sendJson(ws, {
+        type: 'session.progress',
+        session_id: sessionId,
+        message_id: messageId,
+        encrypted: true,
+        handshake_id: session.handshakeId,
+        ...encryptedPayload,
+      });
+    } else {
+      sendJson(ws, {
+        type: 'session.progress',
+        session_id: sessionId,
+        message_id: messageId,
+        status: 'running',
+      });
+    }
 
     try {
       const result = await runPrompt({

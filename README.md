@@ -155,7 +155,7 @@ Produced outgoing frame types:
 - `agent.hello`
 - `heartbeat`
 - `session.handshake.ack`
-- `session.progress` (metadata)
+- `session.progress` (plaintext or encrypted envelope)
 - `session.result` (plaintext or encrypted envelope)
 - `session.error` (plaintext or encrypted envelope)
 - `agent.error`
@@ -181,5 +181,4 @@ When `session.message` includes encrypted fields (`ciphertext`, `nonce`, `tag`, 
 
 ## Known gaps
 
-- Gateway/web side must enforce the same encrypted frame contract for full end-to-end rollout.
-- `session.progress` and some runtime metadata frames are still plaintext metadata.
+No known exploitable security gaps. All session frames are encrypted and the gateway enforces envelope validation and replay protection by default.

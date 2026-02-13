@@ -196,7 +196,7 @@ Examples:
 async function cmdLogin(flags: Map<string, string>): Promise<void> {
   const gatewayUrl = normalizeGatewayUrl(optional(flags, 'gateway-url', 'https://api.commands.com'));
   const model = optional(flags, 'model', 'sonnet');
-  const scope = optional(flags, 'scope', 'read_assets write_assets offline_access');
+  const scope = optional(flags, 'scope', 'read_assets write_assets offline_access device');
   const clientId = optional(flags, 'client-id', 'commands-agent');
   const timeoutSeconds = parseIntStrict(optional(flags, 'timeout-seconds', '300'), 'timeout-seconds');
   const headless = hasFlag(flags, 'headless');
@@ -520,7 +520,7 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
 
         const headless = hasFlag(flags, 'headless');
         const openBrowser = !headless && !hasFlag(flags, 'no-open-browser');
-        const oauthScope = effectiveConfig.tokenScope?.trim() || 'read_assets write_assets offline_access';
+        const oauthScope = effectiveConfig.tokenScope?.trim() || 'read_assets write_assets offline_access device';
 
         console.log('[auth] refresh token missing/expired; starting OAuth login to recover session');
         const oauth = await runGatewayOAuthLogin({
