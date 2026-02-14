@@ -345,6 +345,18 @@
   margin-bottom: 14px;
 }
 
+.error-banner {
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: rgba(239, 68, 68, 0.1);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  color: #fca5a5;
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 14px;
+  line-height: 1.4;
+}
+
 /* Settings gear */
 .settings-btn {
   display: flex;

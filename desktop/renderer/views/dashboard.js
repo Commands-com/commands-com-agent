@@ -2,7 +2,7 @@
  * dashboard.js — Welcome / empty state view
  */
 
-import { profiles, isAnyAgentRunning, runningProfileId } from '../state.js';
+import { profiles, isAnyAgentRunning, runningProfileId, escapeHtml } from '../state.js';
 
 export function renderDashboard(container) {
   if (!container) return;
@@ -35,7 +35,7 @@ export function renderDashboard(container) {
     `;
   } else {
     const statusLine = running && runningProfile
-      ? `<span style="color: var(--ok);">${runningProfile.name}</span> is running`
+      ? `<span style="color: var(--ok);">${escapeHtml(runningProfile.name)}</span> is running`
       : 'No agent running';
 
     container.innerHTML = `

@@ -11,9 +11,13 @@ const MAX_AUDIT_RETURN_ENTRIES = 2000;
 // ---------------------------------------------------------------------------
 const PROFILES_DIR = path.join(os.homedir(), '.commands-agent', 'profiles');
 const PROFILES_INDEX = path.join(PROFILES_DIR, 'profiles.json');
+const DEFAULT_AGENT_ROOT = path.resolve(__dirname, '..');
+const DEFAULT_GATEWAY_URL = 'https://api.commands.com';
+const DESKTOP_SETTINGS_PATH = path.join(os.homedir(), '.commands-agent', 'desktop-settings.json');
 const VALID_MODELS = ['opus', 'sonnet', 'haiku'];
 const VALID_PERMISSIONS = ['read-only', 'dev-safe', 'full'];
 const PROFILE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+const TRUSTED_AGENT_PACKAGE_NAMES = new Set(['commands-com-agent']);
 const AVATAR_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
 const AVATAR_MAGIC = {
   png:  Buffer.from([0x89, 0x50, 0x4E, 0x47]),
@@ -21,6 +25,10 @@ const AVATAR_MAGIC = {
   webp_riff: Buffer.from([0x52, 0x49, 0x46, 0x46]),
   webp_tag:  Buffer.from([0x57, 0x45, 0x42, 0x50]),
 };
+
+const auth = require('./auth.js');
+const sessionManager = require('./session-manager.js');
+const gatewayClient = require('./gateway-client.js');
 
 let agentProcess = null;
 let forceKillTimer = null;
@@ -34,6 +42,28 @@ const agentState = {
   launchConfig: null
 };
 
+const RENDERER_INDEX_PATH = path.normalize(path.join(__dirname, 'renderer', 'index.html'));
+
+function normalizeFileUrlPath(url) {
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'file:') {
+    return '';
+  }
+  let filePath = decodeURIComponent(parsed.pathname);
+  if (process.platform === 'win32' && filePath.startsWith('/')) {
+    filePath = filePath.slice(1);
+  }
+  return path.normalize(filePath);
+}
+
+function isAllowedRendererNavigation(url) {
+  try {
+    return normalizeFileUrlPath(url) === RENDERER_INDEX_PATH;
+  } catch {
+    return false;
+  }
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1300,
@@ -46,11 +76,22 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: true
     }
   });
 
-  win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  win.loadFile(RENDERER_INDEX_PATH);
+
+  // Block navigation away from the exact local renderer page (anti-phishing).
+  // Do not allow arbitrary file:// navigations.
+  win.webContents.on('will-navigate', (event, url) => {
+    if (!isAllowedRendererNavigation(url)) {
+      event.preventDefault();
+    }
+  });
+
+  // Block popup windows entirely.
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 }
 
 function sendSignalToAgentProcess(proc, signal) {
@@ -71,6 +112,27 @@ function sendSignalToAgentProcess(proc, signal) {
   } catch (_err) {
     return false;
   }
+}
+
+function waitForAgentProcessExit(proc, timeoutMs) {
+  if (!proc) return Promise.resolve(true);
+  if (proc.exitCode != null || proc.signalCode != null) {
+    return Promise.resolve(true);
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (exited) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      proc.removeListener('close', onClose);
+      resolve(exited);
+    };
+    const onClose = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    proc.once('close', onClose);
+  });
 }
 
 function emitToAllWindows(channel, payload) {
@@ -99,14 +161,102 @@ function emitAgentLog(stream, message) {
   });
 }
 
-function resolveAgentRoot(payload) {
-  if (typeof payload?.agentRoot === 'string' && payload.agentRoot.trim()) {
-    return payload.agentRoot.trim();
+function normalizeAgentRoot(value) {
+  if (typeof value !== 'string') {
+    return '';
   }
-  return path.resolve(__dirname, '..');
+
+  let candidate = value.trim();
+  if (!candidate) {
+    return '';
+  }
+
+  if (candidate === '~') {
+    candidate = os.homedir();
+  } else if (candidate.startsWith('~/')) {
+    candidate = path.join(os.homedir(), candidate.slice(2));
+  }
+
+  if (!path.isAbsolute(candidate)) {
+    return '';
+  }
+
+  return path.normalize(candidate);
 }
 
-function defaultAuditLogPath() {
+function normalizeProfileGatewayUrl(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+
+  const candidate = value.trim();
+  if (!candidate) {
+    return '';
+  }
+
+  try {
+    const parsed = new URL(candidate);
+    if (parsed.username || parsed.password) {
+      return '';
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return '';
+    }
+    if (parsed.protocol === 'http:' && parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
+      return '';
+    }
+    return parsed.origin;
+  } catch {
+    return '';
+  }
+}
+
+function defaultDesktopSettings() {
+  return {
+    defaultAgentRoot: '',
+  };
+}
+
+function sanitizeDesktopSettings(raw) {
+  const settings = defaultDesktopSettings();
+  if (!raw || typeof raw !== 'object') {
+    return settings;
+  }
+  settings.defaultAgentRoot = normalizeAgentRoot(raw.defaultAgentRoot);
+  return settings;
+}
+
+async function readDesktopSettings() {
+  try {
+    const raw = await fs.readFile(DESKTOP_SETTINGS_PATH, 'utf8');
+    return sanitizeDesktopSettings(JSON.parse(raw));
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      return defaultDesktopSettings();
+    }
+    return defaultDesktopSettings();
+  }
+}
+
+async function writeDesktopSettings(settings) {
+  const sanitized = sanitizeDesktopSettings(settings);
+  await fs.mkdir(path.dirname(DESKTOP_SETTINGS_PATH), { recursive: true });
+  await atomicWrite(DESKTOP_SETTINGS_PATH, JSON.stringify(sanitized, null, 2));
+  return sanitized;
+}
+
+function resolveAgentRoot(desktopSettings) {
+  const fromGlobal = normalizeAgentRoot(desktopSettings?.defaultAgentRoot);
+  if (fromGlobal) {
+    return fromGlobal;
+  }
+  return DEFAULT_AGENT_ROOT;
+}
+
+function defaultAuditLogPath(profileId) {
+  if (profileId && validateProfileId(profileId)) {
+    return path.join(PROFILES_DIR, profileId, 'audit.log');
+  }
   return path.join(os.homedir(), '.commands-agent', 'audit.log');
 }
 
@@ -130,6 +280,76 @@ function resolveAuditLogPath(rawPath, agentRoot) {
   return path.normalize(candidate);
 }
 
+async function realpathOrResolve(filePath) {
+  const abs = path.resolve(filePath);
+  try {
+    return await fs.realpath(abs);
+  } catch {
+    return abs;
+  }
+}
+
+async function validateAgentInstallRoot(rootPath) {
+  const normalized = normalizeAgentRoot(rootPath);
+  if (!normalized) {
+    return { ok: false, error: 'Default Agent Install Root must be an absolute path' };
+  }
+
+  const canonicalRoot = await realpathOrResolve(normalized);
+
+  let rootStat;
+  try {
+    rootStat = await fs.stat(canonicalRoot);
+  } catch {
+    return { ok: false, error: 'Default Agent Install Root does not exist' };
+  }
+  if (!rootStat.isDirectory()) {
+    return { ok: false, error: 'Default Agent Install Root must be a directory' };
+  }
+
+  const scriptPath = path.join(canonicalRoot, 'start-agent.sh');
+  try {
+    const scriptStat = await fs.stat(scriptPath);
+    if (!scriptStat.isFile()) {
+      return { ok: false, error: 'Default Agent Install Root must contain start-agent.sh' };
+    }
+  } catch {
+    return { ok: false, error: 'Default Agent Install Root must contain start-agent.sh' };
+  }
+
+  const packageJsonPath = path.join(canonicalRoot, 'package.json');
+  let packageJsonRaw = '';
+  try {
+    packageJsonRaw = await fs.readFile(packageJsonPath, 'utf8');
+  } catch {
+    return { ok: false, error: 'Default Agent Install Root must contain package.json' };
+  }
+
+  let packageJson;
+  try {
+    packageJson = JSON.parse(packageJsonRaw);
+  } catch {
+    return { ok: false, error: 'Default Agent Install Root has invalid package.json' };
+  }
+
+  if (!TRUSTED_AGENT_PACKAGE_NAMES.has(packageJson?.name)) {
+    return { ok: false, error: 'Default Agent Install Root is not a trusted commands-com-agent install' };
+  }
+
+  return { ok: true, rootPath: canonicalRoot };
+}
+
+async function isAllowedAuditLogPath(auditLogPath, profileId, configuredAuditLogPath = '') {
+  const candidate = await realpathOrResolve(auditLogPath);
+  const allowedFiles = [defaultAuditLogPath(profileId)];
+  if (typeof configuredAuditLogPath === 'string' && configuredAuditLogPath.trim()) {
+    allowedFiles.push(configuredAuditLogPath.trim());
+  }
+
+  const resolvedAllowedFiles = await Promise.all(allowedFiles.map((filePath) => realpathOrResolve(filePath)));
+  return resolvedAllowedFiles.some((allowedFile) => path.resolve(allowedFile) === path.resolve(candidate));
+}
+
 function parseIsoDateOrNull(value) {
   if (typeof value !== 'string' || value.trim() === '') {
     return null;
@@ -139,6 +359,35 @@ function parseIsoDateOrNull(value) {
     return null;
   }
   return date.toISOString();
+}
+
+function isPathWithin(baseDir, targetPath) {
+  const base = path.resolve(baseDir);
+  const target = path.resolve(targetPath);
+  const rel = path.relative(base, target);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function normalizeProfileAuditLogPath(rawPath, profileId) {
+  if (!validateProfileId(profileId)) return '';
+  if (typeof rawPath !== 'string') return '';
+
+  let candidate = rawPath.trim();
+  if (!candidate) return '';
+
+  if (candidate === '~') {
+    candidate = os.homedir();
+  } else if (candidate.startsWith('~/')) {
+    candidate = path.join(os.homedir(), candidate.slice(2));
+  }
+
+  if (!path.isAbsolute(candidate)) {
+    return '';
+  }
+
+  const normalized = path.normalize(candidate);
+  const profileDir = path.join(PROFILES_DIR, profileId);
+  return isPathWithin(profileDir, normalized) ? normalized : '';
 }
 
 function extractAuditTimestamp(entry) {
@@ -274,13 +523,13 @@ async function secureCredentials() {
 
   const encrypted = safeStorage.encryptString(JSON.stringify(secrets));
   const credPath = getCredentialsPath();
-  await fs.writeFile(credPath, encrypted);
+  await atomicWriteBuffer(credPath, encrypted);
   if (process.platform !== 'win32') {
     await fs.chmod(credPath, 0o600);
   }
 
   const redacted = redactConfig(config);
-  await fs.writeFile(configPath, JSON.stringify(redacted, null, 2), 'utf8');
+  await atomicWrite(configPath, JSON.stringify(redacted, null, 2));
 
   emitAgentLog('system', '[desktop] credentials encrypted and stored in OS keychain');
   return { ok: true };
@@ -321,7 +570,7 @@ async function restoreCredentials() {
   const secrets = JSON.parse(decrypted);
   const restored = mergeSecrets(config, secrets);
 
-  await fs.writeFile(configPath, JSON.stringify(restored, null, 2), 'utf8');
+  await atomicWrite(configPath, JSON.stringify(restored, null, 2));
 
   emitAgentLog('system', '[desktop] credentials restored from OS keychain');
   return { ok: true };
@@ -337,50 +586,67 @@ function areCredentialsSecured() {
   }
 }
 
-function buildAgentEnv(payload) {
+function buildAgentEnv(launchProfile, runtimeOptions, agentRoot) {
   const env = { ...process.env };
   // Prevent inherited shell env from forcing external MCP config in desktop mode.
   delete env.MCP_CONFIG;
   delete env.MCP_FILESYSTEM_ENABLED;
   delete env.MCP_FILESYSTEM_ROOT;
 
-  if (typeof payload?.gatewayUrl === 'string' && payload.gatewayUrl.trim()) {
-    env.GATEWAY_URL = payload.gatewayUrl.trim();
+  const profileGatewayUrl = typeof launchProfile?.gatewayUrl === 'string' ? launchProfile.gatewayUrl.trim() : '';
+  if (profileGatewayUrl) {
+    env.GATEWAY_URL = normalizeProfileGatewayUrl(profileGatewayUrl) || DEFAULT_GATEWAY_URL;
+  } else {
+    env.GATEWAY_URL = DEFAULT_GATEWAY_URL;
   }
-  if (typeof payload?.deviceName === 'string' && payload.deviceName.trim()) {
-    env.DEVICE_NAME = payload.deviceName.trim();
+
+  const normalizedDeviceName = sanitizeDeviceName(launchProfile?.deviceName);
+  if (normalizedDeviceName) {
+    env.DEVICE_NAME = normalizedDeviceName;
   }
-  if (typeof payload?.defaultCwd === 'string' && payload.defaultCwd.trim()) {
-    env.DEFAULT_CWD = payload.defaultCwd.trim();
+
+  if (typeof launchProfile?.workspace === 'string' && launchProfile.workspace.trim()) {
+    const workspace = launchProfile.workspace.trim();
+    if (path.isAbsolute(workspace)) {
+      env.DEFAULT_CWD = workspace;
+    }
   }
-  if (typeof payload?.model === 'string' && payload.model.trim()) {
-    env.MODEL = payload.model.trim();
+
+  if (typeof launchProfile?.model === 'string' && launchProfile.model.trim()) {
+    env.MODEL = launchProfile.model.trim();
   }
-  if (typeof payload?.permissionProfile === 'string' && payload.permissionProfile.trim()) {
-    env.PERMISSION_PROFILE = payload.permissionProfile.trim();
+
+  if (typeof launchProfile?.permissions === 'string' && launchProfile.permissions.trim()) {
+    env.PERMISSION_PROFILE = launchProfile.permissions.trim();
   }
-  if (typeof payload?.mcpFilesystemRoot === 'string' && payload.mcpFilesystemRoot.trim()) {
-    env.MCP_FILESYSTEM_ROOT = payload.mcpFilesystemRoot.trim();
+
+  if (typeof launchProfile?.mcpFilesystemRoot === 'string' && launchProfile.mcpFilesystemRoot.trim()) {
+    const fsRoot = launchProfile.mcpFilesystemRoot.trim();
+    if (path.isAbsolute(fsRoot)) {
+      env.MCP_FILESYSTEM_ROOT = fsRoot;
+    }
   }
-  if (typeof payload?.mcpFilesystemEnabled === 'boolean') {
-    env.MCP_FILESYSTEM_ENABLED = payload.mcpFilesystemEnabled ? '1' : '0';
+  if (typeof launchProfile?.mcpFilesystemEnabled === 'boolean') {
+    env.MCP_FILESYSTEM_ENABLED = launchProfile.mcpFilesystemEnabled ? '1' : '0';
   }
-  if (typeof payload?.auditLogPath === 'string' && payload.auditLogPath.trim()) {
-    env.AUDIT_LOG_PATH = resolveAuditLogPath(payload.auditLogPath, resolveAgentRoot(payload));
+
+  if (typeof launchProfile?.auditLogPath === 'string' && launchProfile.auditLogPath.trim()) {
+    env.AUDIT_LOG_PATH = resolveAuditLogPath(launchProfile.auditLogPath, agentRoot);
+  } else {
+    env.AUDIT_LOG_PATH = defaultAuditLogPath(launchProfile?.id);
   }
-  if (payload?.forceInit === true) {
+
+  if (runtimeOptions?.forceInit === true) {
     env.INIT_AGENT = '1';
   }
-  if (payload?.authMode === 'manual') {
-    env.AUTH_MODE = 'manual';
-  } else if (payload?.authMode === 'oauth') {
-    env.AUTH_MODE = 'oauth';
-  }
-  if (payload?.headless === true) {
+  env.AUTH_MODE = 'oauth';
+
+  if (runtimeOptions?.headless === true) {
     env.HEADLESS = '1';
   }
-  if (typeof payload?.systemPrompt === 'string' && payload.systemPrompt.trim()) {
-    env.SYSTEM_PROMPT = payload.systemPrompt;
+
+  if (typeof launchProfile?.systemPrompt === 'string' && launchProfile.systemPrompt.trim()) {
+    env.SYSTEM_PROMPT = launchProfile.systemPrompt;
   }
 
   return env;
@@ -395,7 +661,50 @@ async function startAgent(payload = {}) {
     };
   }
 
-  const agentRoot = resolveAgentRoot(payload);
+  if (Object.prototype.hasOwnProperty.call(payload, 'agentRoot')) {
+    return {
+      ok: false,
+      error: 'agentRoot override is not allowed; configure Default Agent Install Root in Settings',
+      status: snapshotAgentState()
+    };
+  }
+
+  const profileId = typeof payload?.profileId === 'string' ? payload.profileId : '';
+  if (!profileId) {
+    return {
+      ok: false,
+      error: 'profileId is required',
+      status: snapshotAgentState()
+    };
+  }
+  if (!validateProfileId(profileId)) {
+    return {
+      ok: false,
+      error: 'invalid profile id',
+      status: snapshotAgentState()
+    };
+  }
+
+  const launchProfile = await readProfileById(profileId);
+  if (!launchProfile) {
+    return {
+      ok: false,
+      error: 'profile not found',
+      status: snapshotAgentState()
+    };
+  }
+
+  const desktopSettings = await readDesktopSettings();
+  const resolvedAgentRoot = resolveAgentRoot(desktopSettings);
+  const rootValidation = await validateAgentInstallRoot(resolvedAgentRoot);
+  if (!rootValidation.ok) {
+    return {
+      ok: false,
+      error: rootValidation.error,
+      status: snapshotAgentState()
+    };
+  }
+  const agentRoot = rootValidation.rootPath;
   const scriptPath = path.join(agentRoot, 'start-agent.sh');
   try {
     await fs.access(scriptPath);
@@ -411,23 +720,18 @@ async function startAgent(payload = {}) {
   // The DEVICE_NAME env var is only used during login/init, but if the config
   // already exists, init is skipped and the old deviceId persists. This ensures
   // a profile rename is picked up without requiring a full re-auth.
-  const desiredDeviceName = typeof payload?.deviceName === 'string' ? payload.deviceName.trim() : '';
+  const desiredDeviceName = typeof launchProfile?.deviceName === 'string' ? launchProfile.deviceName.trim() : '';
   if (desiredDeviceName) {
     try {
       const agentConfigPath = path.join(os.homedir(), '.commands-agent', 'config.json');
       const raw = await fs.readFile(agentConfigPath, 'utf8');
       const agentConfig = JSON.parse(raw);
       // Sanitize to match the agent SDK's sanitizeDeviceSegment logic
-      const desiredId = desiredDeviceName.toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-+|-+$/g, '')
-        .replace(/-+/g, '-')
-        .slice(0, 32)
-        .replace(/-+$/g, '');
+      const desiredId = sanitizeDeviceName(desiredDeviceName);
       if (desiredId && agentConfig.deviceId && agentConfig.deviceId !== desiredId) {
         emitAgentLog('system', `[desktop] updating deviceId: ${agentConfig.deviceId} → ${desiredId}`);
         agentConfig.deviceId = desiredId;
-        const tmp = agentConfigPath + '.tmp.' + Date.now();
+        const tmp = agentConfigPath + '.tmp.' + Date.now() + '.' + randomBytes(4).toString('hex');
         await fs.writeFile(tmp, JSON.stringify(agentConfig, null, 2) + '\n', 'utf8');
         await fs.rename(tmp, agentConfigPath);
       }
@@ -441,6 +745,13 @@ async function startAgent(payload = {}) {
     const restoreResult = await restoreCredentials();
     if (!restoreResult.ok && restoreResult.reason) {
       emitAgentLog('system', `[desktop] credential restore: ${restoreResult.reason}`);
+      if (restoreResult.reason !== 'no config file') {
+        return {
+          ok: false,
+          error: `failed to restore credentials: ${restoreResult.reason}`,
+          status: snapshotAgentState()
+        };
+      }
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -452,13 +763,35 @@ async function startAgent(payload = {}) {
     };
   }
 
-  const env = buildAgentEnv(payload);
-  const child = spawn('/usr/bin/env', ['bash', scriptPath], {
-    cwd: agentRoot,
-    env,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    detached: process.platform !== 'win32'
-  });
+  // Renderer-controlled runtime toggles only. All agent config comes from launchProfile.
+  const runtimeOptions = {
+    forceInit: payload?.forceInit === true,
+    headless: payload?.headless === true,
+  };
+  const env = buildAgentEnv(launchProfile, runtimeOptions, agentRoot);
+  let child;
+  try {
+    child = spawn('/usr/bin/env', ['bash', scriptPath], {
+      cwd: agentRoot,
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32'
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    emitAgentLog('system', `[desktop] failed to spawn agent: ${msg}`);
+    // Credentials were restored above; re-secure them before returning.
+    try {
+      await secureCredentials();
+    } catch (_secureErr) {
+      // best-effort
+    }
+    return {
+      ok: false,
+      error: `failed to start agent: ${msg}`,
+      status: snapshotAgentState()
+    };
+  }
 
   agentProcess = child;
   if (forceKillTimer) {
@@ -472,14 +805,14 @@ async function startAgent(payload = {}) {
   agentState.lastError = '';
   agentState.launchConfig = {
     agentRoot,
-    profileId: payload.profileId || null,
+    profileId: launchProfile?.id || null,
     gatewayUrl: env.GATEWAY_URL || null,
     deviceName: env.DEVICE_NAME || null,
     defaultCwd: env.DEFAULT_CWD || null,
     model: env.MODEL || null,
     permissionProfile: env.PERMISSION_PROFILE || null,
     mcpFilesystemEnabled: env.MCP_FILESYSTEM_ENABLED || null,
-    auditLogPath: env.AUDIT_LOG_PATH || defaultAuditLogPath(),
+    auditLogPath: env.AUDIT_LOG_PATH || defaultAuditLogPath(launchProfile?.id),
     authMode: env.AUTH_MODE || 'oauth',
     forceInit: env.INIT_AGENT === '1',
     headless: env.HEADLESS === '1'
@@ -494,9 +827,14 @@ async function startAgent(payload = {}) {
   // Line-buffered stdout parsing: intercept __DESKTOP_EVENT__ lines,
   // pass everything else as regular log output.
   const EVENT_PREFIX = '__DESKTOP_EVENT__:';
+  const STDOUT_BUFFER_MAX = 1024 * 1024; // 1 MB cap to prevent OOM on long lines
   let stdoutBuffer = '';
   child.stdout.on('data', (chunk) => {
     stdoutBuffer += chunk.toString('utf8');
+    if (stdoutBuffer.length > STDOUT_BUFFER_MAX) {
+      emitAgentLog('system', '[desktop] stdout buffer overflow — truncating');
+      stdoutBuffer = stdoutBuffer.slice(-STDOUT_BUFFER_MAX);
+    }
     const lines = stdoutBuffer.split('\n');
     stdoutBuffer = lines.pop(); // keep incomplete last line in buffer
     for (const line of lines) {
@@ -510,8 +848,12 @@ async function startAgent(payload = {}) {
       }
     }
   });
+  let stderrTail = '';
+  const STDERR_TAIL_MAX = 4096;
   child.stderr.on('data', (chunk) => {
-    emitAgentLog('stderr', chunk.toString('utf8'));
+    const text = chunk.toString('utf8');
+    emitAgentLog('stderr', text);
+    stderrTail = (stderrTail + text).slice(-STDERR_TAIL_MAX);
   });
   child.on('error', (err) => {
     agentState.lastError = err instanceof Error ? err.message : String(err);
@@ -542,10 +884,27 @@ async function startAgent(payload = {}) {
 
     agentState.lastExitCode = Number.isInteger(code) ? code : null;
     agentState.lastExitSignal = signal || '';
+
+    // Detect known fatal errors from stderr and surface user-friendly messages
+    if (code !== 0 && stderrTail) {
+      if (/Failed to register identity key/i.test(stderrTail)) {
+        if (/owned by a different account/i.test(stderrTail) || /403/i.test(stderrTail)) {
+          agentState.lastError = 'Device name is already registered to a different account. Rename the device in Settings or sign in with the original account.';
+        } else {
+          agentState.lastError = 'Failed to register device with gateway. Check logs for details.';
+        }
+      } else if (/ECONNREFUSED|ENOTFOUND|fetch failed/i.test(stderrTail)) {
+        agentState.lastError = 'Could not reach the gateway. Check your internet connection and gateway URL.';
+      }
+    }
+
     emitAgentLog(
       'system',
       `[desktop] agent exited code=${code == null ? 'null' : code} signal=${signal || 'none'}`
     );
+    if (agentState.lastError) {
+      emitAgentLog('system', `[desktop] ${agentState.lastError}`);
+    }
     emitAgentStatus();
 
     // Re-encrypt credentials now that agent has stopped
@@ -616,8 +975,19 @@ ipcMain.handle('desktop:save-json', async (_event, payload) => {
   return { ok: true, filePath: result.filePath };
 });
 
+const SAFE_URL_SCHEMES = new Set(['https:', 'http:', 'mailto:']);
+
 ipcMain.handle('desktop:open-url', async (_event, url) => {
   if (typeof url !== 'string' || url.trim() === '') {
+    return { ok: false, error: 'invalid url' };
+  }
+  // Allowlist URL schemes — block javascript:, data:, file:, etc.
+  try {
+    const parsed = new URL(url);
+    if (!SAFE_URL_SCHEMES.has(parsed.protocol)) {
+      return { ok: false, error: `blocked URL scheme: ${parsed.protocol}` };
+    }
+  } catch {
     return { ok: false, error: 'invalid url' };
   }
   await shell.openExternal(url);
@@ -648,9 +1018,73 @@ ipcMain.handle('desktop:pick-directory', async (event, payload) => {
   return { ok: true, path: result.filePaths[0] };
 });
 
+ipcMain.handle('desktop:settings:get', async () => {
+  try {
+    const settings = await readDesktopSettings();
+    return {
+      ok: true,
+      settings,
+      effectiveAgentRoot: resolveAgentRoot(settings),
+      bundledAgentRoot: DEFAULT_AGENT_ROOT,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:settings:save', async (_event, payload) => {
+  try {
+    const raw = payload?.settings;
+    const requestedRoot = typeof raw?.defaultAgentRoot === 'string' ? raw.defaultAgentRoot.trim() : '';
+    let validatedRoot = '';
+    if (requestedRoot) {
+      const validation = await validateAgentInstallRoot(requestedRoot);
+      if (!validation.ok) {
+        return { ok: false, error: validation.error };
+      }
+      validatedRoot = validation.rootPath;
+    }
+
+    const current = await readDesktopSettings();
+    const next = {
+      ...current,
+      defaultAgentRoot: validatedRoot,
+    };
+    const saved = await writeDesktopSettings(next);
+    return {
+      ok: true,
+      settings: saved,
+      effectiveAgentRoot: resolveAgentRoot(saved),
+      bundledAgentRoot: DEFAULT_AGENT_ROOT,
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
 ipcMain.handle('desktop:audit:read', async (_event, payload) => {
-  const agentRoot = resolveAgentRoot(payload);
-  const auditLogPath = resolveAuditLogPath(payload?.auditLogPath, agentRoot);
+  const profileId = payload?.profileId;
+  if (profileId && !validateProfileId(profileId)) {
+    return { ok: false, error: 'Invalid profile id' };
+  }
+
+  const profile = profileId ? await readProfileById(profileId) : null;
+  if (profileId && !profile) {
+    return { ok: false, error: 'Profile not found' };
+  }
+
+  const desktopSettings = await readDesktopSettings();
+  const agentRoot = resolveAgentRoot(desktopSettings);
+  const configuredAuditLogPath = profile?.auditLogPath || '';
+  const resolvedConfiguredAuditLogPath = configuredAuditLogPath.trim()
+    ? resolveAuditLogPath(configuredAuditLogPath, agentRoot)
+    : '';
+  const auditLogPath = resolvedConfiguredAuditLogPath
+    ? resolvedConfiguredAuditLogPath
+    : defaultAuditLogPath(profileId);
+  if (!(await isAllowedAuditLogPath(auditLogPath, profileId, resolvedConfiguredAuditLogPath))) {
+    return { ok: false, error: 'Invalid auditLogPath: outside allowed directories' };
+  }
   const requestedLimit = Number(payload?.limit);
   const limit = Number.isFinite(requestedLimit)
     ? clamp(Math.trunc(requestedLimit), 1, MAX_AUDIT_RETURN_ENTRIES)
@@ -790,7 +1224,10 @@ ipcMain.handle('desktop:audit:read', async (_event, payload) => {
   };
 });
 
-ipcMain.handle('desktop:agent:start', async (_event, payload) => startAgent(payload || {}));
+ipcMain.handle('desktop:agent:start', async (_event, payload) => {
+  const body = payload && typeof payload === 'object' ? payload : {};
+  return startAgent(body);
+});
 ipcMain.handle('desktop:agent:stop', async (_event, payload) => stopAgent(Boolean(payload?.force)));
 ipcMain.handle('desktop:agent:status', async () => ({ ok: true, status: snapshotAgentState() }));
 
@@ -813,17 +1250,32 @@ ipcMain.handle('desktop:credentials:secure', async () => {
 // Profile storage — helpers
 // ---------------------------------------------------------------------------
 
-function slugify(str) {
-  return String(str || '')
+function sanitizeDeviceName(value) {
+  return String(value || '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
-    .slice(0, 80) || 'agent';
+    .replace(/-+/g, '-')
+    .slice(0, 32)
+    .replace(/-+$/g, '');
+}
+
+function applyDeviceSuffix(base, suffix) {
+  const suffixText = `-${suffix}`;
+  const maxBaseLen = Math.max(1, 32 - suffixText.length);
+  const trimmedBase = base.slice(0, maxBaseLen).replace(/-+$/g, '') || 'agent';
+  return `${trimmedBase}${suffixText}`;
 }
 
 async function atomicWrite(filePath, data) {
-  const tmp = filePath + '.tmp.' + Date.now();
+  const tmp = filePath + '.tmp.' + Date.now() + '.' + randomBytes(4).toString('hex');
   await fs.writeFile(tmp, data, 'utf8');
+  await fs.rename(tmp, filePath);
+}
+
+async function atomicWriteBuffer(filePath, data) {
+  const tmp = filePath + '.tmp.' + Date.now() + '.' + randomBytes(4).toString('hex');
+  await fs.writeFile(tmp, data);
   await fs.rename(tmp, filePath);
 }
 
@@ -886,6 +1338,23 @@ function validateProfileId(id) {
   return typeof id === 'string' && PROFILE_ID_RE.test(id);
 }
 
+async function readProfileById(id) {
+  if (!validateProfileId(id)) {
+    return null;
+  }
+
+  const profilePath = path.join(PROFILES_DIR, id, 'profile.json');
+  try {
+    const raw = await fs.readFile(profilePath, 'utf8');
+    return migrateProfile(JSON.parse(raw));
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      return null;
+    }
+    throw err;
+  }
+}
+
 function sanitizeProfilePayload(incoming) {
   const allowed = {};
 
@@ -929,14 +1398,13 @@ function sanitizeProfilePayload(incoming) {
 
   // gatewayUrl — valid URL or empty
   if (typeof incoming.gatewayUrl === 'string') {
-    if (incoming.gatewayUrl.trim() === '') {
+    const trimmedGatewayUrl = incoming.gatewayUrl.trim();
+    if (trimmedGatewayUrl === '') {
       allowed.gatewayUrl = '';
     } else {
-      try {
-        new URL(incoming.gatewayUrl);
-        allowed.gatewayUrl = incoming.gatewayUrl;
-      } catch (_e) {
-        // invalid URL, drop
+      const normalizedGatewayUrl = normalizeProfileGatewayUrl(trimmedGatewayUrl);
+      if (normalizedGatewayUrl) {
+        allowed.gatewayUrl = normalizedGatewayUrl;
       }
     }
   }
@@ -958,29 +1426,38 @@ function sanitizeProfilePayload(incoming) {
 
   // mcpFilesystemRoot
   if (typeof incoming.mcpFilesystemRoot === 'string') {
-    allowed.mcpFilesystemRoot = incoming.mcpFilesystemRoot;
+    const fsRoot = incoming.mcpFilesystemRoot.trim();
+    if (fsRoot === '' || path.isAbsolute(fsRoot)) {
+      allowed.mcpFilesystemRoot = fsRoot;
+    }
   }
 
   return allowed;
 }
 
 function resolveDeviceName(profile, allProfiles) {
+  const usedNames = new Set(
+    (allProfiles || [])
+      .filter((p) => p.id !== profile.id)
+      .map((p) => sanitizeDeviceName(p.deviceName))
+      .filter((name) => name.length > 0)
+  );
+
   // If manually set, keep it as-is
   if (profile.deviceNameManuallySet && profile.deviceName) {
-    return profile.deviceName;
+    const manual = sanitizeDeviceName(profile.deviceName);
+    if (manual) {
+      return manual;
+    }
   }
 
   // Auto-generate from name
-  const base = slugify(profile.name || 'agent');
+  const base = sanitizeDeviceName(profile.name || profile.deviceName || 'agent') || 'agent';
   let candidate = base;
   let suffix = 2;
 
-  while (true) {
-    const collision = allProfiles.find(
-      (p) => p.id !== profile.id && p.deviceName === candidate
-    );
-    if (!collision) break;
-    candidate = `${base}-${suffix}`;
+  while (usedNames.has(candidate)) {
+    candidate = applyDeviceSuffix(base, suffix);
     suffix += 1;
   }
 
@@ -1090,6 +1567,7 @@ ipcMain.handle('desktop:profiles:save', async (_event, payload) => {
       }
 
       const deviceName = resolveDeviceName(sanitized, allProfiles);
+      const normalizedAuditLogPath = normalizeProfileAuditLogPath(sanitized.auditLogPath, id);
 
       profile = {
         version: 1,
@@ -1102,7 +1580,7 @@ ipcMain.handle('desktop:profiles:save', async (_event, payload) => {
         model: sanitized.model || 'sonnet',
         permissions: sanitized.permissions || 'dev-safe',
         gatewayUrl: sanitized.gatewayUrl || '',
-        auditLogPath: sanitized.auditLogPath || '',
+        auditLogPath: normalizedAuditLogPath,
         mcpServers: sanitized.mcpServers || '',
         mcpFilesystemEnabled: sanitized.mcpFilesystemEnabled || false,
         mcpFilesystemRoot: sanitized.mcpFilesystemRoot || '',
@@ -1163,6 +1641,7 @@ ipcMain.handle('desktop:profiles:save', async (_event, payload) => {
 
       // Resolve deviceName
       profile.deviceName = resolveDeviceName(profile, allProfiles);
+      profile.auditLogPath = normalizeProfileAuditLogPath(profile.auditLogPath, existing.id);
 
       await atomicWrite(profilePath, JSON.stringify(profile, null, 2));
 
@@ -1197,6 +1676,18 @@ ipcMain.handle('desktop:profiles:delete', async (_event, payload) => {
     const entryIdx = index.profiles.findIndex((p) => p.id === id);
     if (entryIdx === -1) {
       return { ok: false, error: 'Profile not found' };
+    }
+
+    // Deregister device from gateway (best-effort — don't block local delete)
+    const profile = await readProfileById(id);
+    const deviceName = profile?.deviceName;
+    if (deviceName && auth.isSignedIn()) {
+      try {
+        const gatewayUrl = getGatewayUrl();
+        await gatewayClient.deleteDevice(gatewayUrl, deviceName);
+      } catch (err) {
+        console.log(`[profiles] gateway device deregister failed for ${deviceName}: ${err.message || err}`);
+      }
     }
 
     // Remove directory
@@ -1317,14 +1808,14 @@ ipcMain.handle('desktop:profiles:migrate', async (_event, payload) => {
       version: 1,
       id,
       name,
-      deviceName: slugify(name),
+      deviceName: sanitizeDeviceName(name) || 'agent',
       deviceNameManuallySet: false,
       systemPrompt: legacyState.systemPrompt || '',
       workspace: legacyState.workspace || legacyState.defaultCwd || '',
       model: legacyState.model || 'sonnet',
       permissions: legacyState.permissionProfile || 'dev-safe',
       gatewayUrl: legacyState.gatewayUrl || '',
-      auditLogPath: legacyState.auditLogPath || '',
+      auditLogPath: normalizeProfileAuditLogPath(legacyState.auditLogPath || '', id),
       mcpServers: '',
       mcpFilesystemEnabled: legacyState.mcpFilesystemEnabled || false,
       mcpFilesystemRoot: legacyState.mcpFilesystemRoot || '',
@@ -1348,6 +1839,203 @@ ipcMain.handle('desktop:profiles:migrate', async (_event, payload) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Auth IPC handlers
+// ---------------------------------------------------------------------------
+
+ipcMain.handle('desktop:auth:sign-in', async () => {
+  try {
+    return await auth.signIn();
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:auth:sign-out', async () => {
+  try {
+    sessionManager.endAllSessions();
+    stopDeviceSSE();
+    _msgTimestamps.clear();
+    auth.signOut();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:auth:status', async () => {
+  return { ok: true, ...auth.getAuthStatus() };
+});
+
+// ---------------------------------------------------------------------------
+// Gateway IPC handlers
+// ---------------------------------------------------------------------------
+
+const DEVICE_ID_RE = /^[a-zA-Z0-9._:-]+$/;
+
+ipcMain.handle('desktop:gateway:devices', async () => {
+  try {
+    const gatewayUrl = getGatewayUrl();
+    const result = await gatewayClient.fetchDevices(gatewayUrl);
+    const devices = result.devices || result;
+    return { ok: true, devices };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:gateway:start-session', async (_event, payload) => {
+  try {
+    const deviceId = payload?.deviceId;
+    if (typeof deviceId !== 'string' || deviceId.length > 128 || !DEVICE_ID_RE.test(deviceId)) {
+      return { ok: false, error: 'Invalid deviceId' };
+    }
+    const gatewayUrl = getGatewayUrl();
+    return await sessionManager.startSession(gatewayUrl, deviceId);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+// Rate limiting for sendMessage: 10 msg/sec per device
+const _msgTimestamps = new Map(); // deviceId → [timestamps]
+const MSG_RATE_WINDOW_MS = 1000;
+const MSG_RATE_LIMIT = 10;
+const MSG_RATE_MAX_TRACKED_DEVICES = 500;
+
+function pruneMsgRateState(now) {
+  for (const [key, timestamps] of _msgTimestamps.entries()) {
+    const recent = timestamps.filter((t) => now - t < MSG_RATE_WINDOW_MS);
+    if (recent.length > 0) {
+      _msgTimestamps.set(key, recent);
+    } else {
+      _msgTimestamps.delete(key);
+    }
+  }
+  while (_msgTimestamps.size > MSG_RATE_MAX_TRACKED_DEVICES) {
+    const oldestKey = _msgTimestamps.keys().next().value;
+    if (oldestKey === undefined) break;
+    _msgTimestamps.delete(oldestKey);
+  }
+}
+
+ipcMain.handle('desktop:gateway:send-message', async (_event, payload) => {
+  try {
+    const deviceId = payload?.deviceId;
+    const text = payload?.text;
+    if (typeof deviceId !== 'string' || deviceId.length > 128 || !DEVICE_ID_RE.test(deviceId)) {
+      return { ok: false, error: 'Invalid deviceId' };
+    }
+    if (typeof text !== 'string' || text.length > 100_000) {
+      return { ok: false, error: 'Invalid message (must be string <= 100000 chars)' };
+    }
+
+    // Rate limit check
+    const now = Date.now();
+    pruneMsgRateState(now);
+    const timestamps = _msgTimestamps.get(deviceId) || [];
+    const recent = timestamps;
+    if (recent.length >= MSG_RATE_LIMIT) {
+      return { ok: false, error: 'Rate limit exceeded (10 msg/sec)' };
+    }
+    recent.push(now);
+    _msgTimestamps.set(deviceId, recent);
+
+    const gatewayUrl = getGatewayUrl();
+    return await sessionManager.sendChatMessage(gatewayUrl, deviceId, text);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:gateway:end-session', async (_event, payload) => {
+  try {
+    const deviceId = payload?.deviceId;
+    if (typeof deviceId !== 'string' || deviceId.length > 128 || !DEVICE_ID_RE.test(deviceId)) {
+      return { ok: false, error: 'Invalid deviceId' };
+    }
+    sessionManager.endSession(deviceId);
+    _msgTimestamps.delete(deviceId);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Device SSE subscription (auto-start on sign-in, auto-stop on sign-out)
+// ---------------------------------------------------------------------------
+
+let _deviceSseAbort = null;
+let _lastAuthUid = null;
+
+function getGatewayUrl() {
+  // Use the gateway URL from auth (which tracks config.json / sign-in source)
+  // to avoid token/endpoint mismatch when running against non-prod gateways.
+  return auth.getGatewayUrl?.() || 'https://api.commands.com';
+}
+
+function startDeviceSSE() {
+  if (_deviceSseAbort) return; // already running
+  _deviceSseAbort = new AbortController();
+  const gatewayUrl = getGatewayUrl();
+  const currentAbort = _deviceSseAbort;
+  gatewayClient.subscribeDeviceEvents(
+    gatewayUrl,
+    (sseEvent) => {
+      try {
+        const data = JSON.parse(sseEvent.data);
+        emitToAllWindows('desktop:gateway-device-event', data);
+      } catch {
+        // skip malformed
+      }
+    },
+    currentAbort.signal
+  ).catch((err) => {
+    if (currentAbort.signal.aborted) return;
+    const message = err instanceof Error ? err.message : String(err);
+    emitAgentLog('system', `[desktop] device SSE stopped: ${message}`);
+    emitToAllWindows('desktop:gateway-device-event', {
+      type: 'device.sse.error',
+      error: message,
+    });
+  }).finally(() => {
+    // Clear the guard so SSE can be restarted (e.g. after terminal error or abort)
+    if (_deviceSseAbort === currentAbort) {
+      _deviceSseAbort = null;
+    }
+  });
+}
+
+function stopDeviceSSE() {
+  if (_deviceSseAbort) {
+    _deviceSseAbort.abort();
+    _deviceSseAbort = null;
+  }
+}
+
+// Listen for auth state changes to auto-start/stop device SSE
+auth.onAuthChanged((status) => {
+  const prevUid = _lastAuthUid;
+  const nextUid = status.signedIn ? (status.uid || null) : null;
+  _lastAuthUid = nextUid;
+
+  emitToAllWindows('desktop:auth-changed', status);
+  if (status.signedIn) {
+    // If account switched without an explicit sign-out, tear down prior sessions.
+    if (prevUid && nextUid && prevUid !== nextUid) {
+      sessionManager.endAllSessions();
+      _msgTimestamps.clear();
+      stopDeviceSSE();
+    }
+    startDeviceSSE();
+  } else {
+    stopDeviceSSE();
+    sessionManager.endAllSessions();
+    _msgTimestamps.clear();
+  }
+});
+
 app.whenReady().then(async () => {
   // On startup, if credentials are in plaintext (e.g. after a crash), secure them.
   if (safeStorage.isEncryptionAvailable() && !areCredentialsSecured()) {
@@ -1357,6 +2045,9 @@ app.whenReady().then(async () => {
       // Best-effort — app is starting
     }
   }
+
+  // Try loading auth from existing agent config (skips OAuth if already registered)
+  auth.tryLoadFromConfig();
 
   createWindow();
   emitAgentStatus();
@@ -1369,16 +2060,47 @@ app.whenReady().then(async () => {
   });
 });
 
-app.on('before-quit', async () => {
-  if (agentProcess) {
-    sendSignalToAgentProcess(agentProcess, 'SIGTERM');
+let _quitSecureInFlight = false;
+let _finalQuitRequested = false;
+app.on('before-quit', (event) => {
+  // Final pass (triggered by app.quit() below) should continue shutdown.
+  if (_finalQuitRequested) {
+    return;
   }
-  // Ensure credentials are secured on quit regardless of agent state
-  try {
-    await secureCredentials();
-  } catch (_err) {
-    // Best-effort — app is closing
+
+  // Ignore duplicate before-quit emissions while shutdown is already in progress.
+  if (_quitSecureInFlight) {
+    event.preventDefault();
+    return;
   }
+
+  event.preventDefault();
+  _quitSecureInFlight = true;
+
+  // Secure credentials before allowing process exit.
+  Promise.resolve()
+    .then(async () => {
+      const proc = agentProcess;
+      if (proc) {
+        emitAgentLog('system', '[desktop] stopping agent before quit');
+        sendSignalToAgentProcess(proc, 'SIGTERM');
+        const exitedGracefully = await waitForAgentProcessExit(proc, 5000);
+        if (!exitedGracefully && agentProcess === proc) {
+          emitAgentLog('system', '[desktop] agent did not exit during quit; escalating to SIGKILL');
+          sendSignalToAgentProcess(proc, 'SIGKILL');
+          await waitForAgentProcessExit(proc, 2000);
+        }
+      }
+
+      await secureCredentials();
+    })
+    .catch(() => {
+      // Best-effort — app is closing
+    })
+    .finally(() => {
+      _finalQuitRequested = true;
+      app.quit();
+    });
 });
 
 app.on('window-all-closed', () => {

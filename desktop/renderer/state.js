@@ -6,6 +6,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 export const DEFAULT_GATEWAY_URL = 'https://api.commands.com';
+export const DEFAULT_AGENT_INSTALL_ROOT = '';
 export const MAX_RUNTIME_LOG_LINES = 600;
 export const DEFAULT_AUDIT_LIMIT = 200;
 export const MAX_AUDIT_LIMIT = 2000;
@@ -30,6 +31,42 @@ export const viewState = {
   selectedAgentId: null,
   agentDetailTab: 'conversations', // conversations | logs | audit | settings
 };
+
+// ---------------------------------------------------------------------------
+// App settings (global)
+// ---------------------------------------------------------------------------
+export const appSettings = {
+  defaultAgentRoot: DEFAULT_AGENT_INSTALL_ROOT,
+  effectiveAgentRoot: DEFAULT_AGENT_INSTALL_ROOT,
+  bundledAgentRoot: DEFAULT_AGENT_INSTALL_ROOT,
+};
+
+export function updateAppSettings(settings) {
+  appSettings.defaultAgentRoot =
+    typeof settings?.defaultAgentRoot === 'string' ? settings.defaultAgentRoot : DEFAULT_AGENT_INSTALL_ROOT;
+  appSettings.effectiveAgentRoot =
+    typeof settings?.effectiveAgentRoot === 'string' ? settings.effectiveAgentRoot : DEFAULT_AGENT_INSTALL_ROOT;
+  appSettings.bundledAgentRoot =
+    typeof settings?.bundledAgentRoot === 'string' ? settings.bundledAgentRoot : DEFAULT_AGENT_INSTALL_ROOT;
+}
+
+export async function loadAppSettings() {
+  const result = await window.commandsDesktop.settings.get();
+  if (result?.ok) {
+    updateAppSettings({
+      defaultAgentRoot: result.settings?.defaultAgentRoot,
+      effectiveAgentRoot: result.effectiveAgentRoot,
+      bundledAgentRoot: result.bundledAgentRoot,
+    });
+    return appSettings;
+  }
+  updateAppSettings({
+    defaultAgentRoot: DEFAULT_AGENT_INSTALL_ROOT,
+    effectiveAgentRoot: DEFAULT_AGENT_INSTALL_ROOT,
+    bundledAgentRoot: DEFAULT_AGENT_INSTALL_ROOT,
+  });
+  return appSettings;
+}
 
 // ---------------------------------------------------------------------------
 // Profiles
@@ -283,6 +320,106 @@ export function getSessionList() {
 export function getSelectedSession() {
   if (!conversationState.selectedSessionId) return null;
   return conversationState.sessions.get(conversationState.selectedSessionId) || null;
+}
+
+// ---------------------------------------------------------------------------
+// Auth state (shared agents)
+// ---------------------------------------------------------------------------
+export const authState = { signedIn: false, email: '', uid: '' };
+
+export function updateAuthState(status) {
+  authState.signedIn = Boolean(status?.signedIn);
+  authState.email = status?.email || '';
+  authState.uid = status?.uid || '';
+}
+
+// ---------------------------------------------------------------------------
+// Shared agents state
+// ---------------------------------------------------------------------------
+export const sharedAgentsState = {
+  devices: [],           // [{ device_id, status, role }]
+  selectedDeviceId: null,
+};
+
+export function updateSharedDevices(devices) {
+  sharedAgentsState.devices = Array.isArray(devices) ? devices : [];
+}
+
+export function updateDeviceStatus(deviceId, status) {
+  const device = sharedAgentsState.devices.find((d) => d.device_id === deviceId);
+  if (device) {
+    device.status = status;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chat state (E2E encrypted sessions with shared agents)
+// ---------------------------------------------------------------------------
+const MAX_CHAT_MESSAGES = 500;
+
+/** Map<deviceId, { status, messages: [{ role, text, ts, messageId }] }> */
+export const chatState = new Map();
+
+export function processChatEvent(event) {
+  if (!event || !event.type) return;
+
+  const deviceId = event.deviceId;
+  if (!deviceId) return;
+
+  let chat = chatState.get(deviceId);
+  if (!chat) {
+    chat = { status: 'idle', messages: [] };
+    chatState.set(deviceId, chat);
+  }
+
+  switch (event.type) {
+    case 'session.handshaking':
+    case 'session.reconnecting':
+      chat.status = 'handshaking';
+      break;
+    case 'session.ready':
+      chat.status = 'ready';
+      break;
+    case 'session.ended':
+      chat.status = 'ended';
+      break;
+    case 'session.error':
+      chat.status = 'error';
+      chat.messages.push({ role: 'error', text: event.error || 'Connection error', ts: new Date().toISOString() });
+      break;
+    case 'message.sent':
+      // Don't downgrade from 'processing' — keeps the thinking indicator visible
+      // when the user sends a follow-up while the agent is still working.
+      if (chat.status !== 'processing') {
+        chat.status = 'ready';
+      }
+      chat.messages.push({ role: 'user', text: event.text, ts: event.ts, messageId: event.messageId });
+      break;
+    case 'message.received':
+      chat.status = 'ready';
+      chat.messages.push({ role: 'assistant', text: event.text, ts: event.ts, messageId: event.messageId });
+      break;
+    case 'message.error':
+      // Only reset to ready if we were processing (waiting for agent response).
+      // Don't set ready if session isn't actually established.
+      if (chat.status === 'processing') {
+        chat.status = 'ready';
+      }
+      chat.messages.push({ role: 'error', text: event.error || 'Message error', ts: new Date().toISOString() });
+      break;
+    case 'message.progress':
+      chat.status = 'processing';
+      break;
+  }
+
+  // Enforce bounded message cap
+  while (chat.messages.length > MAX_CHAT_MESSAGES) {
+    chat.messages.shift();
+  }
+}
+
+export function clearChatState() {
+  chatState.clear();
 }
 
 // ---------------------------------------------------------------------------

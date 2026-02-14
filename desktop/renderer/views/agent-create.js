@@ -51,7 +51,8 @@ function renderForm(container, profile, isEdit) {
 
   // Sub-tab switching
   container.querySelector('#create-sub-tabs')?.addEventListener('click', (e) => {
-    const btn = e.target.closest('[data-create-tab]');
+    const target = e.target instanceof Element ? e.target : null;
+    const btn = target ? target.closest('[data-create-tab]') : null;
     if (!btn) return;
 
     // Capture current values before switching

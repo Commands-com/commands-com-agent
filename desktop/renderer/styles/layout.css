@@ -101,9 +101,13 @@
   font-weight: 500;
 }
 
-.sidebar-agents {
+.sidebar-scroll {
   flex: 1;
   overflow-y: auto;
+  min-height: 0;
+}
+
+.sidebar-agents {
   padding: 0 14px 14px;
 }
 

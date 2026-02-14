@@ -2,7 +2,7 @@
  * settings.js — App-level settings view
  */
 
-import { escapeHtml, profiles, DEFAULT_GATEWAY_URL } from '../state.js';
+import { escapeHtml, profiles, DEFAULT_GATEWAY_URL, appSettings, updateAppSettings } from '../state.js';
 
 export function renderSettings(container) {
   if (!container) return;
@@ -21,6 +21,22 @@ export function renderSettings(container) {
         </p>
         <input type="text" id="default-gateway-url" value="${escapeHtml(DEFAULT_GATEWAY_URL)}" placeholder="https://api.commands.com" disabled />
         <p class="hint">Gateway URL is currently set per-agent. Global default coming in a future update.</p>
+      </div>
+
+      <div class="card">
+        <h3>Default Agent Install Root</h3>
+        <p style="font-size: 12px; color: var(--muted); margin-bottom: 8px;">
+          Used for all agents. This directory must contain <code>start-agent.sh</code>.
+        </p>
+        <div class="path-input">
+          <input type="text" id="default-agent-root" value="${escapeHtml(appSettings.defaultAgentRoot)}" placeholder="Optional (leave blank to use bundled default)" />
+          <button class="path-picker-btn" id="browse-default-agent-root">Browse</button>
+        </div>
+        <p class="hint">Effective root: <code>${escapeHtml(appSettings.effectiveAgentRoot || appSettings.bundledAgentRoot || '')}</code></p>
+        <div style="display: flex; align-items: center; gap: 8px; margin-top: 8px;">
+          <button id="save-default-agent-root" style="font-size: 12px;">Save Default Root</button>
+          <span id="default-agent-root-status" class="hint"></span>
+        </div>
       </div>
 
       <div class="card">
@@ -63,6 +79,48 @@ export function renderSettings(container) {
     if (result.ok) {
       loadGlobalCredStatus(container);
     }
+  });
+
+  container.querySelector('#browse-default-agent-root')?.addEventListener('click', async () => {
+    const result = await window.commandsDesktop.pickDirectory({
+      title: 'Select Default Agent Install Root',
+      defaultPath: container.querySelector('#default-agent-root')?.value || undefined,
+    });
+    if (result.ok && result.path) {
+      const input = container.querySelector('#default-agent-root');
+      if (input) input.value = result.path;
+    }
+  });
+
+  container.querySelector('#save-default-agent-root')?.addEventListener('click', async () => {
+    const input = container.querySelector('#default-agent-root');
+    const statusEl = container.querySelector('#default-agent-root-status');
+    if (!input || !statusEl) return;
+
+    statusEl.textContent = '';
+    statusEl.style.color = 'var(--muted)';
+
+    const result = await window.commandsDesktop.settings.save({
+      defaultAgentRoot: input.value.trim(),
+    });
+
+    if (!result?.ok) {
+      statusEl.textContent = result?.error || 'Failed to save';
+      statusEl.style.color = 'var(--danger)';
+      return;
+    }
+
+    updateAppSettings({
+      defaultAgentRoot: result.settings?.defaultAgentRoot,
+      effectiveAgentRoot: result.effectiveAgentRoot,
+      bundledAgentRoot: result.bundledAgentRoot,
+    });
+    input.value = appSettings.defaultAgentRoot || '';
+    statusEl.textContent = 'Saved';
+    statusEl.style.color = 'var(--ok)';
+    setTimeout(() => {
+      if (statusEl) statusEl.textContent = '';
+    }, 2000);
   });
 
   // Export all profiles

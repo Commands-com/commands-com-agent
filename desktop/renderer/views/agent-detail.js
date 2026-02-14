@@ -12,6 +12,25 @@ import {
   DEFAULT_GATEWAY_URL,
   conversationState, getSessionList, getSelectedSession,
 } from '../state.js';
+import { renderMarkdownUntrusted } from '../markdown.js';
+
+// Block javascript: and data: URL schemes in rendered markdown HTML
+function sanitizeUrls(html) {
+  return html
+    .replace(/href\s*=\s*["']?\s*javascript:/gi, 'href="#blocked:')
+    .replace(/href\s*=\s*["']?\s*data:/gi, 'href="#blocked:')
+    .replace(/src\s*=\s*["']?\s*javascript:/gi, 'src="#blocked:')
+    .replace(/src\s*=\s*["']?\s*data:/gi, 'src="#blocked:');
+}
+
+function renderMarkdownSafe(text) {
+  try {
+    const html = renderMarkdownUntrusted(text);
+    return sanitizeUrls(html);
+  } catch {
+    return escapeHtml(text);
+  }
+}
 
 const TABS = [
   { id: 'conversations', label: 'Live Conversations' },
@@ -57,6 +76,12 @@ export async function renderAgentDetail(container, profileId) {
        </div>`
     : '';
 
+  // Error banner (shown when agent exited with a known error)
+  const lastError = !running && runtimeState.status.lastError ? runtimeState.status.lastError : '';
+  const errorBannerHtml = lastError
+    ? `<div class="error-banner">${escapeHtml(lastError)}</div>`
+    : '';
+
   // Start/Stop button
   let startStopHtml;
   if (running) {
@@ -72,6 +97,7 @@ export async function renderAgentDetail(container, profileId) {
 
   container.innerHTML = `
     ${bannerHtml}
+    ${errorBannerHtml}
     <div class="detail-header">
       <div class="avatar-circle lg">
         ${hasAvatar ? `<img src="file://${escapeHtml(avatarPath)}" alt="" />` : botIconSvg(48, profile.name)}
@@ -99,7 +125,8 @@ export async function renderAgentDetail(container, profileId) {
 
   // Wire up tab bar
   container.querySelector('#detail-tab-bar')?.addEventListener('click', (e) => {
-    const btn = e.target.closest('[data-tab]');
+    const target = e.target instanceof Element ? e.target : null;
+    const btn = target ? target.closest('[data-tab]') : null;
     if (!btn) return;
     viewState.agentDetailTab = btn.dataset.tab;
     renderAgentDetail(container, profileId);
@@ -237,7 +264,7 @@ function renderConversationsTab(container) {
         `;
       }
       if (m.role === 'assistant') {
-        const renderedText = window.commandsDesktop.renderMarkdown(m.text);
+        const renderedText = renderMarkdownSafe(m.text);
         const meta = [];
         if (m.turns) meta.push(`${m.turns} turn${m.turns !== 1 ? 's' : ''}`);
         if (m.model) meta.push(m.model);
@@ -301,17 +328,26 @@ function renderConversationsTab(container) {
   }
 
   // Wire up external link clicks in rendered markdown
+  // Use a.href (resolved by browser) not getAttribute('href') to prevent
+  // scheme bypass via HTML entity encoding (e.g. javascript&#58;)
   container.querySelectorAll('.agent-prose a').forEach((a) => {
     a.addEventListener('click', (e) => {
       e.preventDefault();
-      const href = a.getAttribute('href');
-      if (href) window.commandsDesktop.openUrl(href);
+      try {
+        const parsed = new URL(a.href);
+        if (parsed.protocol === 'https:' || parsed.protocol === 'http:' || parsed.protocol === 'mailto:') {
+          window.commandsDesktop.openUrl(a.href);
+        }
+      } catch {
+        // invalid URL — ignore
+      }
     });
   });
 
   // Wire up session selection
   container.querySelector('#session-list')?.addEventListener('click', (e) => {
-    const card = e.target.closest('[data-session-id]');
+    const target = e.target instanceof Element ? e.target : null;
+    const card = target ? target.closest('[data-session-id]') : null;
     if (!card) return;
     conversationState.selectedSessionId = card.dataset.sessionId;
     renderConversationsTab(container);
@@ -379,6 +415,7 @@ async function loadAuditEntries(container, profile) {
   const filters = auditState.filters;
 
   const payload = {
+    profileId: profile.id,
     auditLogPath,
     limit: filters.limit,
     search: filters.search,
@@ -600,7 +637,72 @@ const SETTINGS_SUB_TABS = [
   { id: 'security', label: 'Security' },
 ];
 
-function renderSettingsTab(container, profile, extra = {}) {
+// In-memory form state that persists across settings sub-tab switches.
+// Initialized from the profile when entering the settings tab, then updated
+// from the DOM before each sub-tab switch so edits aren't lost.
+let settingsFormState = {};
+
+function initSettingsFormState(profile) {
+  settingsFormState = {
+    name: profile.name || '',
+    deviceName: profile.deviceName || '',
+    deviceNameManuallySet: profile.deviceNameManuallySet || false,
+    systemPrompt: profile.systemPrompt || '',
+    workspace: profile.workspace || '',
+    model: profile.model || 'sonnet',
+    permissions: profile.permissions || 'dev-safe',
+    gatewayUrl: profile.gatewayUrl || '',
+    auditLogPath: profile.auditLogPath || '',
+    mcpServers: profile.mcpServers || '',
+    mcpFilesystemEnabled: profile.mcpFilesystemEnabled || false,
+    mcpFilesystemRoot: profile.mcpFilesystemRoot || '',
+  };
+}
+
+function captureSettingsValues(container) {
+  switch (settingsSubTab) {
+    case 'identity': {
+      const n = container.querySelector('#s-name');
+      if (n) settingsFormState.name = n.value.trim();
+      const dn = container.querySelector('#s-device-name');
+      if (dn) settingsFormState.deviceName = dn.value.trim();
+      const sp = container.querySelector('#s-system-prompt');
+      if (sp) settingsFormState.systemPrompt = sp.value;
+      const ws = container.querySelector('#s-workspace');
+      if (ws) settingsFormState.workspace = ws.value.trim();
+      const autoSlug = slugify(settingsFormState.name);
+      settingsFormState.deviceNameManuallySet = settingsFormState.deviceName !== autoSlug;
+      break;
+    }
+    case 'config': {
+      const m = container.querySelector('#s-model');
+      if (m) settingsFormState.model = m.value;
+      const p = container.querySelector('#s-permissions');
+      if (p) settingsFormState.permissions = p.value;
+      const gw = container.querySelector('#s-gateway-url');
+      if (gw) settingsFormState.gatewayUrl = gw.value.trim();
+      const al = container.querySelector('#s-audit-path');
+      if (al) settingsFormState.auditLogPath = al.value.trim();
+      break;
+    }
+    case 'mcp': {
+      const fs = container.querySelector('#s-mcp-fs-enabled');
+      if (fs) settingsFormState.mcpFilesystemEnabled = fs.checked;
+      const fr = container.querySelector('#s-mcp-fs-root');
+      if (fr) settingsFormState.mcpFilesystemRoot = fr.value.trim();
+      const ms = container.querySelector('#s-mcp-servers');
+      if (ms) settingsFormState.mcpServers = ms.value;
+      break;
+    }
+  }
+}
+
+function renderSettingsTab(container, profile, extra = {}, _internal = false) {
+  // Initialize form state from profile on first entry (not on internal sub-tab switches)
+  if (!_internal) {
+    initSettingsFormState(profile);
+  }
+
   const subTabHtml = SETTINGS_SUB_TABS.map((t) =>
     `<button class="tab-btn${t.id === settingsSubTab ? ' active' : ''}" data-settings-tab="${t.id}">${t.label}</button>`
   ).join('');
@@ -617,13 +719,14 @@ function renderSettingsTab(container, profile, extra = {}) {
 
   renderSettingsSubContent(container.querySelector('#settings-sub-content'), profile, extra);
 
-  // Sub-tab switching
+  // Sub-tab switching — capture current DOM values before switching
   container.querySelector('#settings-sub-tabs')?.addEventListener('click', (e) => {
-    const btn = e.target.closest('[data-settings-tab]');
+    const target = e.target instanceof Element ? e.target : null;
+    const btn = target ? target.closest('[data-settings-tab]') : null;
     if (!btn) return;
+    captureSettingsValues(container);
     settingsSubTab = btn.dataset.settingsTab;
-    // Re-render just settings tab content without full detail re-render
-    renderSettingsTab(container, profile, extra);
+    renderSettingsTab(container, profile, extra, true);
   });
 
   // Save all settings
@@ -657,65 +760,25 @@ function renderSettingsTab(container, profile, extra = {}) {
 }
 
 function gatherSettingsPayload(container, profile) {
-  // Gather from all sub-tab fields (they persist in the DOM even when hidden via the card wrappers)
-  // Since sub-tabs re-render, we only read from the currently visible sub-tab
-  // and merge with the existing profile for fields not currently shown
-  const payload = {
+  // Capture the active sub-tab's DOM values into settingsFormState first
+  captureSettingsValues(container);
+
+  // Build payload from settingsFormState (which accumulates edits across all sub-tabs)
+  return {
     id: profile.id,
-    name: profile.name,
-    deviceName: profile.deviceName,
-    deviceNameManuallySet: profile.deviceNameManuallySet,
-    systemPrompt: profile.systemPrompt,
-    workspace: profile.workspace,
-    model: profile.model,
-    permissions: profile.permissions,
-    gatewayUrl: profile.gatewayUrl,
-    auditLogPath: profile.auditLogPath,
-    mcpServers: profile.mcpServers,
-    mcpFilesystemEnabled: profile.mcpFilesystemEnabled,
-    mcpFilesystemRoot: profile.mcpFilesystemRoot,
+    name: settingsFormState.name,
+    deviceName: settingsFormState.deviceName,
+    deviceNameManuallySet: settingsFormState.deviceNameManuallySet,
+    systemPrompt: settingsFormState.systemPrompt,
+    workspace: settingsFormState.workspace,
+    model: settingsFormState.model,
+    permissions: settingsFormState.permissions,
+    gatewayUrl: settingsFormState.gatewayUrl,
+    auditLogPath: settingsFormState.auditLogPath,
+    mcpServers: settingsFormState.mcpServers,
+    mcpFilesystemEnabled: settingsFormState.mcpFilesystemEnabled,
+    mcpFilesystemRoot: settingsFormState.mcpFilesystemRoot,
   };
-
-  // Override with current DOM values based on which sub-tab is active
-  switch (settingsSubTab) {
-    case 'identity': {
-      const name = container.querySelector('#s-name')?.value;
-      if (name !== undefined) payload.name = name.trim();
-      const dn = container.querySelector('#s-device-name')?.value;
-      if (dn !== undefined) payload.deviceName = dn.trim();
-      const sp = container.querySelector('#s-system-prompt')?.value;
-      if (sp !== undefined) payload.systemPrompt = sp;
-      const ws = container.querySelector('#s-workspace')?.value;
-      if (ws !== undefined) payload.workspace = ws.trim();
-      // Check if device name was manually edited
-      const autoSlug = slugify(payload.name);
-      payload.deviceNameManuallySet = payload.deviceName !== autoSlug;
-      break;
-    }
-    case 'config': {
-      const model = container.querySelector('#s-model')?.value;
-      if (model) payload.model = model;
-      const perm = container.querySelector('#s-permissions')?.value;
-      if (perm) payload.permissions = perm;
-      const gw = container.querySelector('#s-gateway-url')?.value;
-      if (gw !== undefined) payload.gatewayUrl = gw.trim();
-      const al = container.querySelector('#s-audit-path')?.value;
-      if (al !== undefined) payload.auditLogPath = al.trim();
-      break;
-    }
-    case 'mcp': {
-      const fsEnabled = container.querySelector('#s-mcp-fs-enabled');
-      if (fsEnabled) payload.mcpFilesystemEnabled = fsEnabled.checked;
-      const fsRoot = container.querySelector('#s-mcp-fs-root')?.value;
-      if (fsRoot !== undefined) payload.mcpFilesystemRoot = fsRoot.trim();
-      const mcpJson = container.querySelector('#s-mcp-servers')?.value;
-      if (mcpJson !== undefined) payload.mcpServers = mcpJson;
-      break;
-    }
-    // security tab has no saveable profile fields
-  }
-
-  return payload;
 }
 
 function renderSettingsSubContent(container, profile, extra) {
@@ -739,6 +802,7 @@ function renderSettingsSubContent(container, profile, extra) {
 
 function renderSettingsIdentity(container, profile, extra) {
   const hasAvatar = extra.hasAvatar;
+  const fs = settingsFormState;
 
   container.innerHTML = `
     <div style="max-width: 580px;">
@@ -760,11 +824,11 @@ function renderSettingsIdentity(container, profile, extra) {
         <div class="field-grid">
           <label>
             <span>Name</span>
-            <input type="text" id="s-name" value="${escapeHtml(profile.name)}" placeholder="My Codebot" maxlength="200" />
+            <input type="text" id="s-name" value="${escapeHtml(fs.name)}" placeholder="My Codebot" maxlength="200" />
           </label>
           <label>
             <span>Device Name ${infoIcon('The slug used when connecting to the gateway. Auto-generated from name unless manually edited.')}</span>
-            <input type="text" id="s-device-name" value="${escapeHtml(profile.deviceName || '')}" placeholder="my-codebot" maxlength="200" />
+            <input type="text" id="s-device-name" value="${escapeHtml(fs.deviceName)}" placeholder="my-codebot" maxlength="200" />
           </label>
         </div>
       </div>
@@ -773,7 +837,7 @@ function renderSettingsIdentity(container, profile, extra) {
         <h3>System Prompt</h3>
         <label>
           <span>Instructions for the agent</span>
-          <textarea id="s-system-prompt" rows="8" placeholder="You are a helpful assistant...">${escapeHtml(profile.systemPrompt || '')}</textarea>
+          <textarea id="s-system-prompt" rows="8" placeholder="You are a helpful assistant...">${escapeHtml(fs.systemPrompt)}</textarea>
         </label>
       </div>
 
@@ -782,7 +846,7 @@ function renderSettingsIdentity(container, profile, extra) {
         <label>
           <span>Directory</span>
           <div class="path-input">
-            <input type="text" id="s-workspace" value="${escapeHtml(profile.workspace || '')}" placeholder="/Users/you/Code/my-project" />
+            <input type="text" id="s-workspace" value="${escapeHtml(fs.workspace)}" placeholder="/Users/you/Code/my-project" />
             <button class="path-picker-btn" id="s-browse-workspace">Browse</button>
           </div>
         </label>
@@ -794,7 +858,7 @@ function renderSettingsIdentity(container, profile, extra) {
   const nameInput = container.querySelector('#s-name');
   const deviceNameInput = container.querySelector('#s-device-name');
   nameInput?.addEventListener('input', () => {
-    if (!profile.deviceNameManuallySet) {
+    if (!fs.deviceNameManuallySet) {
       deviceNameInput.value = slugify(nameInput.value);
     }
   });
@@ -822,12 +886,13 @@ function renderSettingsIdentity(container, profile, extra) {
 }
 
 function renderSettingsConfig(container, profile) {
+  const fs = settingsFormState;
   const modelOpts = MODEL_OPTIONS.map((o) =>
-    `<option value="${o.value}"${o.value === profile.model ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
+    `<option value="${o.value}"${o.value === fs.model ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
   ).join('');
 
   const permOpts = PERMISSION_OPTIONS.map((o) =>
-    `<option value="${o.value}"${o.value === profile.permissions ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
+    `<option value="${o.value}"${o.value === fs.permissions ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
   ).join('');
 
   container.innerHTML = `
@@ -851,11 +916,11 @@ function renderSettingsConfig(container, profile) {
         <div class="field-grid">
           <label>
             <span>Gateway URL</span>
-            <input type="text" id="s-gateway-url" value="${escapeHtml(profile.gatewayUrl || '')}" placeholder="${DEFAULT_GATEWAY_URL}" />
+            <input type="text" id="s-gateway-url" value="${escapeHtml(fs.gatewayUrl)}" placeholder="${DEFAULT_GATEWAY_URL}" />
           </label>
           <label>
             <span>Audit Log Path</span>
-            <input type="text" id="s-audit-path" value="${escapeHtml(profile.auditLogPath || '')}" placeholder="~/.commands-agent/audit.log" />
+            <input type="text" id="s-audit-path" value="${escapeHtml(fs.auditLogPath)}" placeholder="~/.commands-agent/profiles/${escapeHtml(profile.id)}/audit.log" />
           </label>
         </div>
       </div>
@@ -879,7 +944,8 @@ function renderSettingsConfig(container, profile) {
 }
 
 function renderSettingsMcp(container, profile) {
-  const fsEnabled = profile.mcpFilesystemEnabled || false;
+  const fs = settingsFormState;
+  const fsEnabled = fs.mcpFilesystemEnabled;
 
   container.innerHTML = `
     <div style="max-width: 580px;">
@@ -893,7 +959,7 @@ function renderSettingsMcp(container, profile) {
           <label>
             <span>Filesystem Root Path</span>
             <div class="path-input">
-              <input type="text" id="s-mcp-fs-root" value="${escapeHtml(profile.mcpFilesystemRoot || '')}" placeholder="/Users/you/Code" />
+              <input type="text" id="s-mcp-fs-root" value="${escapeHtml(fs.mcpFilesystemRoot)}" placeholder="/Users/you/Code" />
               <button class="path-picker-btn" id="s-browse-mcp-fs-root">Browse</button>
             </div>
           </label>
@@ -905,7 +971,7 @@ function renderSettingsMcp(container, profile) {
         <p style="font-size: 12px; color: var(--muted); margin-bottom: 8px;">
           Paste your MCP server configuration JSON here. This is passed directly to the agent runtime.
         </p>
-        <textarea id="s-mcp-servers" rows="8" placeholder='{"mcpServers": {...}}' style="font-family: var(--mono); font-size: 12px;">${escapeHtml(profile.mcpServers || '')}</textarea>
+        <textarea id="s-mcp-servers" rows="8" placeholder='{"mcpServers": {...}}' style="font-family: var(--mono); font-size: 12px;">${escapeHtml(fs.mcpServers)}</textarea>
       </div>
     </div>
   `;
@@ -978,18 +1044,8 @@ async function loadCredentialStatus(container) {
 async function startAgent(profile) {
   const payload = {
     profileId: profile.id,
-    gatewayUrl: profile.gatewayUrl || DEFAULT_GATEWAY_URL,
-    deviceName: profile.deviceName || 'agent',
-    defaultCwd: profile.workspace || '',
-    model: profile.model || 'sonnet',
-    permissionProfile: profile.permissions || 'dev-safe',
-    auditLogPath: profile.auditLogPath || '',
-    mcpFilesystemEnabled: Boolean(profile.mcpFilesystemEnabled),
-    mcpFilesystemRoot: profile.mcpFilesystemRoot || '',
-    systemPrompt: profile.systemPrompt || '',
     forceInit: false,
     headless: false,
-    authMode: 'oauth',
   };
 
   // Read runtime options from settings tab if visible
