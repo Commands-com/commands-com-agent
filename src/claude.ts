@@ -10,6 +10,7 @@ interface RunPromptInput {
   prompt: string;
   cwd: string;
   model: string;
+  systemPrompt?: string;
   maxTurns?: number;
   resumeSessionId?: string;
   mcpServers?: AgentMcpServers;
@@ -107,6 +108,7 @@ export async function runPrompt(input: RunPromptInput): Promise<ClaudeRunResult>
     cwd: input.cwd,
     model: sdkModel,
     maxTurns: input.maxTurns ?? 40,
+    ...(input.systemPrompt ? { systemPrompt: input.systemPrompt } : {}),
   };
 
   if (input.resumeSessionId) {

@@ -39,6 +39,7 @@ export interface AgentConfig {
   permissionProfile?: PermissionProfile;
   identity: AgentIdentity;
   mcpServers?: AgentMcpServers;
+  systemPrompt?: string;
   policyConfigPath?: string;
   auditLogPath?: string;
   refreshToken?: string;

@@ -128,6 +128,15 @@ function sendJson(ws: WebSocket, payload: unknown): void {
   });
 }
 
+/**
+ * Emit a structured event line to stdout that the desktop app can intercept.
+ * Format: __DESKTOP_EVENT__:{json}\n
+ */
+function emitDesktopEvent(event: string, data: Record<string, unknown>): void {
+  const line = JSON.stringify({ event, ...data, ts: new Date().toISOString() });
+  process.stdout.write(`__DESKTOP_EVENT__:${line}\n`);
+}
+
 class AgentRuntime {
   private readonly sessions = new Map<string, RuntimeSession>();
   private backoffMs: number;
@@ -316,6 +325,7 @@ class AgentRuntime {
       const sessionId = firstString(parsed.session_id, parsed.sessionId);
       if (sessionId) {
         this.sessions.delete(sessionId);
+        emitDesktopEvent('session.ended', { sessionId });
       }
       sendJson(ws, {
         type: 'session.cancelled',
@@ -371,15 +381,18 @@ class AgentRuntime {
         requireGatewayAck: false,
       });
 
+      const establishedAt = new Date().toISOString();
       this.sessions.set(sessionId, {
         sessionId,
         handshakeId,
-        establishedAt: new Date().toISOString(),
+        establishedAt,
         keys: ack.sessionKeys,
         claudeSessionId: undefined,
         nextIncomingSeq: 1,
         nextOutgoingSeq: 1,
       });
+
+      emitDesktopEvent('session.started', { sessionId, handshakeId, establishedAt });
 
       sendJson(ws, {
         type: 'session.handshake.ack',
@@ -652,6 +665,13 @@ class AgentRuntime {
       console.log(`[runtime] audit log write failed: ${msg}`);
     }
 
+    emitDesktopEvent('session.message', {
+      sessionId,
+      messageId,
+      requesterUid: requesterUID,
+      prompt,
+    });
+
     if (encryptedRequest) {
       const seq = session.nextOutgoingSeq;
       const direction: FrameDirection = 'agent_to_client';
@@ -693,6 +713,7 @@ class AgentRuntime {
         prompt,
         cwd,
         model: this.config.model,
+        systemPrompt: this.config.systemPrompt,
         resumeSessionId: session.claudeSessionId,
         mcpServers: this.config.mcpServers,
         policy: this.config.policy,
@@ -700,6 +721,15 @@ class AgentRuntime {
       if (result.sessionId) {
         session.claudeSessionId = result.sessionId;
       }
+
+      emitDesktopEvent('session.result', {
+        sessionId,
+        messageId,
+        result: typeof result.result === 'string' ? result.result : '',
+        turns: result.turns,
+        costUsd: result.costUsd,
+        model: result.model,
+      });
 
       if (encryptedRequest) {
         const seq = session.nextOutgoingSeq;
@@ -746,6 +776,7 @@ class AgentRuntime {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      emitDesktopEvent('session.error', { sessionId, messageId, error: msg });
       this.sendSessionError(ws, {
         sessionId,
         messageId,

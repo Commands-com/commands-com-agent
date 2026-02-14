@@ -21,6 +21,7 @@ DEFAULT_MCP_CONFIG_PATH="${ROOT_DIR}/mcp-servers.local.json"
 MCP_CONFIG="${MCP_CONFIG:-$DEFAULT_MCP_CONFIG_PATH}"
 MCP_FILESYSTEM_ROOT="${MCP_FILESYSTEM_ROOT:-$HOME}"
 MCP_FILESYSTEM_ENABLED="${MCP_FILESYSTEM_ENABLED:-1}"
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 AUTH_MODE="${AUTH_MODE:-oauth}" # oauth | manual
 HEADLESS="${HEADLESS:-0}"
 BUILD_AGENT="${BUILD_AGENT:-1}"
@@ -121,10 +122,17 @@ if [[ "$INIT_AGENT" == "0" ]]; then
 fi
 echo "[agent] gateway=$GATEWAY_URL model=$MODEL permission_profile=$PERMISSION_PROFILE cwd=$DEFAULT_CWD heartbeat_ms=$HEARTBEAT_MS auth_mode=$AUTH_MODE init_agent=$INIT_AGENT audit_log=$AUDIT_LOG_PATH mcp_config=$MCP_CONFIG mcp_filesystem_enabled=$MCP_FILESYSTEM_ENABLED"
 
-exec node dist/index.js start \
-  --default-cwd "$DEFAULT_CWD" \
-  --heartbeat-ms "$HEARTBEAT_MS" \
-  --audit-log-path "$AUDIT_LOG_PATH" \
-  --model "$MODEL" \
-  --permission-profile "$PERMISSION_PROFILE" \
+START_ARGS=(
+  --default-cwd "$DEFAULT_CWD"
+  --heartbeat-ms "$HEARTBEAT_MS"
+  --audit-log-path "$AUDIT_LOG_PATH"
+  --model "$MODEL"
+  --permission-profile "$PERMISSION_PROFILE"
   --mcp-config "$MCP_CONFIG"
+)
+
+if [[ -n "$SYSTEM_PROMPT" ]]; then
+  START_ARGS+=(--system-prompt "$SYSTEM_PROMPT")
+fi
+
+exec node dist/index.js start "${START_ARGS[@]}"

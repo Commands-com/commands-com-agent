@@ -1,0 +1,154 @@
+/* layout.css — app shell, topbar, hub grid, sidebar, main panel */
+
+.app-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--glass-border);
+  background: rgba(12, 16, 23, 0.95);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.brand p {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.brand-mark {
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+}
+
+.topbar-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.topbar-actions button {
+  border: 1px solid var(--glass-border);
+  border-radius: 8px;
+  background: rgba(21, 27, 39, 0.8);
+  color: var(--ink);
+  padding: 8px 14px;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.topbar-actions button:hover {
+  border-color: var(--brand);
+  background: #1e2433;
+  transform: translateY(-1px);
+}
+
+/* Hub layout — sidebar + main panel */
+.hub-layout {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 0;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Sidebar */
+.sidebar {
+  border-right: 1px solid var(--glass-border);
+  background: #111720;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.sidebar-section {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sidebar-section-label {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.sidebar-agents {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 14px 14px;
+}
+
+.sidebar-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--glass-border);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Main panel */
+.main-panel {
+  padding: 24px;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* When conversations panel is shown, switch to flex layout so it fills available space */
+.main-panel:has(.conversations-layout) {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Panel container (card-like wrapper used inside main panel) */
+.panel {
+  border: 1px solid var(--glass-border);
+  border-radius: 12px;
+  background: #131923;
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+@media (max-width: 900px) {
+  .hub-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    border-right: none;
+    border-bottom: 1px solid var(--glass-border);
+    max-height: 200px;
+  }
+}

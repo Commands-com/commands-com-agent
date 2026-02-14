@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Commands.com Desktop</title>
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./styles/main.css" />
   </head>
   <body>
     <div class="app-shell">
@@ -19,7 +19,7 @@
           </svg>
           <div>
             <h1>Commands.com Desktop</h1>
-            <p>Local Agent Setup Wizard</p>
+            <p>Agent Hub</p>
           </div>
         </div>
         <div class="topbar-actions">
@@ -27,34 +27,12 @@
         </div>
       </header>
 
-      <main class="layout">
-        <aside class="steps">
-          <p class="steps-label">Wizard Steps</p>
-          <div id="wizard-steps"></div>
-          <div class="steps-help">
-            <p>This runs locally on your machine.</p>
-            <p>Profiles + config are saved in browser local state.</p>
-          </div>
-        </aside>
-
-        <section class="panel">
-          <section id="step-1" class="wizard-panel"></section>
-          <section id="step-2" class="wizard-panel hidden"></section>
-          <section id="step-3" class="wizard-panel hidden"></section>
-          <section id="step-4" class="wizard-panel hidden"></section>
-          <section id="step-5" class="wizard-panel hidden"></section>
-
-          <footer class="wizard-nav">
-            <button id="prev-step">Previous</button>
-            <div class="wizard-nav-right">
-              <button id="reset-wizard" class="danger">Reset</button>
-              <button id="next-step" class="primary">Next</button>
-            </div>
-          </footer>
-        </section>
+      <main class="hub-layout">
+        <aside id="sidebar" class="sidebar"></aside>
+        <section id="main-panel" class="main-panel"></section>
       </main>
     </div>
 
-    <script src="./app.js"></script>
+    <script type="module" src="./app.js"></script>
   </body>
 </html>

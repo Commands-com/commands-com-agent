@@ -140,18 +140,18 @@ function generatedDeviceID(userID?: string, deviceName?: string): string {
     if (!namedPart) {
       throw new Error('device name must include letters or numbers');
     }
-    return `dev-${namedPart}`;
+    return namedPart;
   }
 
   const hostPart = sanitizeDeviceSegment(os.hostname(), 18);
   const userPart = sanitizeDeviceSegment(userID ?? 'user', 12) || 'user';
 
   if (hostPart) {
-    return `dev-${hostPart}-${userPart}`;
+    return `${hostPart}-${userPart}`;
   }
 
   const suffix = crypto.randomBytes(4).toString('hex');
-  return `dev-${userPart}-${suffix}`;
+  return `${userPart}-${suffix}`;
 }
 
 function createRuntimePolicy(permissionProfile: PermissionProfile, allowedRoot: string): AgentConfig['policy'] {
@@ -442,6 +442,7 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
     flags.get('permission-profile')?.trim(),
     config.permissionProfile ?? 'dev-safe'
   );
+  const systemPrompt = flags.get('system-prompt')?.trim() || '';
   const runtimePolicy = createRuntimePolicy(permissionProfile, defaultCwd);
 
   if (reconnectMinMs > reconnectMaxMs) {
@@ -455,6 +456,7 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
     permissionProfile,
     policy: runtimePolicy,
     ...(mcpServers ? { mcpServers } : {}),
+    ...(systemPrompt ? { systemPrompt } : {}),
   };
   const savePersistentConfig = async (): Promise<void> => {
     const { policy: _policy, ...persistable } = effectiveConfig;
@@ -582,6 +584,9 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
   console.log(`[runtime] default-cwd=${defaultCwd}`);
   console.log(`[runtime] audit-log=${auditLogPath}`);
   console.log(`[runtime] mcp-servers=${describeMcpServers(effectiveConfig.mcpServers)}`);
+  if (effectiveConfig.systemPrompt) {
+    console.log(`[runtime] system-prompt=${effectiveConfig.systemPrompt.length} chars`);
+  }
   if (flags.get('mcp-config')) {
     console.log(`[runtime] using mcp config: ${flags.get('mcp-config')}`);
   }

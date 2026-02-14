@@ -3,7 +3,24 @@ const os = require('node:os');
 const fs = require('node:fs/promises');
 const { spawn } = require('node:child_process');
 const { app, BrowserWindow, dialog, ipcMain, shell, safeStorage } = require('electron');
+const { randomBytes } = require('node:crypto');
 const MAX_AUDIT_RETURN_ENTRIES = 2000;
+
+// ---------------------------------------------------------------------------
+// Profile storage constants
+// ---------------------------------------------------------------------------
+const PROFILES_DIR = path.join(os.homedir(), '.commands-agent', 'profiles');
+const PROFILES_INDEX = path.join(PROFILES_DIR, 'profiles.json');
+const VALID_MODELS = ['opus', 'sonnet', 'haiku'];
+const VALID_PERMISSIONS = ['read-only', 'dev-safe', 'full'];
+const PROFILE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+const AVATAR_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
+const AVATAR_MAGIC = {
+  png:  Buffer.from([0x89, 0x50, 0x4E, 0x47]),
+  jpeg: Buffer.from([0xFF, 0xD8, 0xFF]),
+  webp_riff: Buffer.from([0x52, 0x49, 0x46, 0x46]),
+  webp_tag:  Buffer.from([0x57, 0x45, 0x42, 0x50]),
+};
 
 let agentProcess = null;
 let forceKillTimer = null;
@@ -20,9 +37,9 @@ const agentState = {
 function createWindow() {
   const win = new BrowserWindow({
     width: 1300,
-    height: 900,
+    height: 1050,
     minWidth: 1100,
-    minHeight: 760,
+    minHeight: 860,
     title: 'Commands.com Desktop',
     backgroundColor: '#0c1017',
     webPreferences: {
@@ -362,6 +379,9 @@ function buildAgentEnv(payload) {
   if (payload?.headless === true) {
     env.HEADLESS = '1';
   }
+  if (typeof payload?.systemPrompt === 'string' && payload.systemPrompt.trim()) {
+    env.SYSTEM_PROMPT = payload.systemPrompt;
+  }
 
   return env;
 }
@@ -385,6 +405,35 @@ async function startAgent(payload = {}) {
       error: `start script not found at ${scriptPath}`,
       status: snapshotAgentState()
     };
+  }
+
+  // Sync device name into agent config.json if it changed.
+  // The DEVICE_NAME env var is only used during login/init, but if the config
+  // already exists, init is skipped and the old deviceId persists. This ensures
+  // a profile rename is picked up without requiring a full re-auth.
+  const desiredDeviceName = typeof payload?.deviceName === 'string' ? payload.deviceName.trim() : '';
+  if (desiredDeviceName) {
+    try {
+      const agentConfigPath = path.join(os.homedir(), '.commands-agent', 'config.json');
+      const raw = await fs.readFile(agentConfigPath, 'utf8');
+      const agentConfig = JSON.parse(raw);
+      // Sanitize to match the agent SDK's sanitizeDeviceSegment logic
+      const desiredId = desiredDeviceName.toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .replace(/-+/g, '-')
+        .slice(0, 32)
+        .replace(/-+$/g, '');
+      if (desiredId && agentConfig.deviceId && agentConfig.deviceId !== desiredId) {
+        emitAgentLog('system', `[desktop] updating deviceId: ${agentConfig.deviceId} → ${desiredId}`);
+        agentConfig.deviceId = desiredId;
+        const tmp = agentConfigPath + '.tmp.' + Date.now();
+        await fs.writeFile(tmp, JSON.stringify(agentConfig, null, 2) + '\n', 'utf8');
+        await fs.rename(tmp, agentConfigPath);
+      }
+    } catch (_err) {
+      // config.json may not exist yet (first run); init will create it
+    }
   }
 
   // Restore credentials from OS keychain before starting the agent
@@ -423,6 +472,7 @@ async function startAgent(payload = {}) {
   agentState.lastError = '';
   agentState.launchConfig = {
     agentRoot,
+    profileId: payload.profileId || null,
     gatewayUrl: env.GATEWAY_URL || null,
     deviceName: env.DEVICE_NAME || null,
     defaultCwd: env.DEFAULT_CWD || null,
@@ -441,8 +491,24 @@ async function startAgent(payload = {}) {
   );
   emitAgentStatus();
 
+  // Line-buffered stdout parsing: intercept __DESKTOP_EVENT__ lines,
+  // pass everything else as regular log output.
+  const EVENT_PREFIX = '__DESKTOP_EVENT__:';
+  let stdoutBuffer = '';
   child.stdout.on('data', (chunk) => {
-    emitAgentLog('stdout', chunk.toString('utf8'));
+    stdoutBuffer += chunk.toString('utf8');
+    const lines = stdoutBuffer.split('\n');
+    stdoutBuffer = lines.pop(); // keep incomplete last line in buffer
+    for (const line of lines) {
+      if (line.startsWith(EVENT_PREFIX)) {
+        try {
+          const payload = JSON.parse(line.slice(EVENT_PREFIX.length));
+          emitToAllWindows('desktop:conversation-event', payload);
+        } catch (_e) { /* malformed event line — skip */ }
+      } else if (line.length > 0) {
+        emitAgentLog('stdout', line);
+      }
+    }
   });
   child.stderr.on('data', (chunk) => {
     emitAgentLog('stderr', chunk.toString('utf8'));
@@ -453,6 +519,19 @@ async function startAgent(payload = {}) {
     emitAgentStatus();
   });
   child.on('close', (code, signal) => {
+    // Flush any remaining stdout buffer
+    if (stdoutBuffer.length > 0) {
+      if (stdoutBuffer.startsWith(EVENT_PREFIX)) {
+        try {
+          const payload = JSON.parse(stdoutBuffer.slice(EVENT_PREFIX.length));
+          emitToAllWindows('desktop:conversation-event', payload);
+        } catch (_e) { /* skip */ }
+      } else {
+        emitAgentLog('stdout', stdoutBuffer);
+      }
+      stdoutBuffer = '';
+    }
+
     if (forceKillTimer) {
       clearTimeout(forceKillTimer);
       forceKillTimer = null;
@@ -727,6 +806,545 @@ ipcMain.handle('desktop:credentials:secure', async () => {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { ok: false, error: msg };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Profile storage — helpers
+// ---------------------------------------------------------------------------
+
+function slugify(str) {
+  return String(str || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'agent';
+}
+
+async function atomicWrite(filePath, data) {
+  const tmp = filePath + '.tmp.' + Date.now();
+  await fs.writeFile(tmp, data, 'utf8');
+  await fs.rename(tmp, filePath);
+}
+
+async function ensureProfilesDir() {
+  await fs.mkdir(PROFILES_DIR, { recursive: true });
+}
+
+async function readProfilesIndex() {
+  try {
+    const raw = await fs.readFile(PROFILES_INDEX, 'utf8');
+    const index = JSON.parse(raw);
+    return migrateProfilesIndex(index);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      return { version: 1, profiles: [], activeProfileId: null };
+    }
+    throw err;
+  }
+}
+
+async function writeProfilesIndex(index) {
+  await ensureProfilesDir();
+  await atomicWrite(PROFILES_INDEX, JSON.stringify(index, null, 2));
+}
+
+function migrateProfilesIndex(index) {
+  if (!index || typeof index !== 'object') {
+    return { version: 1, profiles: [], activeProfileId: null };
+  }
+  if (!index.version || index.version < 1) {
+    index.version = 1;
+    index.profiles = Array.isArray(index.profiles) ? index.profiles : [];
+    index.activeProfileId = index.activeProfileId || null;
+  }
+  return index;
+}
+
+function migrateProfile(profile) {
+  if (!profile || typeof profile !== 'object') {
+    return profile;
+  }
+  if (!profile.version || profile.version < 1) {
+    profile.version = 1;
+    profile.systemPrompt = profile.systemPrompt || '';
+    profile.mcpServers = profile.mcpServers || '';
+    profile.gatewayUrl = profile.gatewayUrl || '';
+    profile.auditLogPath = profile.auditLogPath || '';
+    profile.deviceNameManuallySet = profile.deviceNameManuallySet || false;
+  }
+  return profile;
+}
+
+function generateProfileId() {
+  const ts = Date.now();
+  const rand = randomBytes(4).toString('hex');
+  return `profile_${ts}_${rand}`;
+}
+
+function validateProfileId(id) {
+  return typeof id === 'string' && PROFILE_ID_RE.test(id);
+}
+
+function sanitizeProfilePayload(incoming) {
+  const allowed = {};
+
+  // id — immutable, only accepted on create (validated separately)
+  if (typeof incoming.id === 'string') allowed.id = incoming.id;
+
+  // name — required, max 200
+  if (typeof incoming.name === 'string') {
+    allowed.name = incoming.name.slice(0, 200);
+  }
+
+  // deviceName — max 200
+  if (typeof incoming.deviceName === 'string') {
+    allowed.deviceName = incoming.deviceName.slice(0, 200);
+  }
+
+  // deviceNameManuallySet
+  if (typeof incoming.deviceNameManuallySet === 'boolean') {
+    allowed.deviceNameManuallySet = incoming.deviceNameManuallySet;
+  }
+
+  // systemPrompt — max 50k
+  if (typeof incoming.systemPrompt === 'string') {
+    allowed.systemPrompt = incoming.systemPrompt.slice(0, 50000);
+  }
+
+  // workspace — must be absolute
+  if (typeof incoming.workspace === 'string' && path.isAbsolute(incoming.workspace)) {
+    allowed.workspace = incoming.workspace;
+  }
+
+  // model
+  if (typeof incoming.model === 'string' && VALID_MODELS.includes(incoming.model)) {
+    allowed.model = incoming.model;
+  }
+
+  // permissions
+  if (typeof incoming.permissions === 'string' && VALID_PERMISSIONS.includes(incoming.permissions)) {
+    allowed.permissions = incoming.permissions;
+  }
+
+  // gatewayUrl — valid URL or empty
+  if (typeof incoming.gatewayUrl === 'string') {
+    if (incoming.gatewayUrl.trim() === '') {
+      allowed.gatewayUrl = '';
+    } else {
+      try {
+        new URL(incoming.gatewayUrl);
+        allowed.gatewayUrl = incoming.gatewayUrl;
+      } catch (_e) {
+        // invalid URL, drop
+      }
+    }
+  }
+
+  // auditLogPath
+  if (typeof incoming.auditLogPath === 'string') {
+    allowed.auditLogPath = incoming.auditLogPath;
+  }
+
+  // mcpServers — raw JSON string
+  if (typeof incoming.mcpServers === 'string') {
+    allowed.mcpServers = incoming.mcpServers.slice(0, 100000);
+  }
+
+  // mcpFilesystemEnabled
+  if (typeof incoming.mcpFilesystemEnabled === 'boolean') {
+    allowed.mcpFilesystemEnabled = incoming.mcpFilesystemEnabled;
+  }
+
+  // mcpFilesystemRoot
+  if (typeof incoming.mcpFilesystemRoot === 'string') {
+    allowed.mcpFilesystemRoot = incoming.mcpFilesystemRoot;
+  }
+
+  return allowed;
+}
+
+function resolveDeviceName(profile, allProfiles) {
+  // If manually set, keep it as-is
+  if (profile.deviceNameManuallySet && profile.deviceName) {
+    return profile.deviceName;
+  }
+
+  // Auto-generate from name
+  const base = slugify(profile.name || 'agent');
+  let candidate = base;
+  let suffix = 2;
+
+  while (true) {
+    const collision = allProfiles.find(
+      (p) => p.id !== profile.id && p.deviceName === candidate
+    );
+    if (!collision) break;
+    candidate = `${base}-${suffix}`;
+    suffix += 1;
+  }
+
+  return candidate;
+}
+
+function checkAvatarMagicBytes(buffer) {
+  if (buffer.length < 8) return false;
+
+  // PNG: 89 50 4E 47
+  if (buffer.subarray(0, 4).equals(AVATAR_MAGIC.png)) return true;
+
+  // JPEG: FF D8 FF
+  if (buffer.subarray(0, 3).equals(AVATAR_MAGIC.jpeg)) return true;
+
+  // WebP: RIFF....WEBP
+  if (
+    buffer.subarray(0, 4).equals(AVATAR_MAGIC.webp_riff) &&
+    buffer.length >= 12 &&
+    buffer.subarray(8, 12).equals(AVATAR_MAGIC.webp_tag)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Profile storage — IPC handlers
+// ---------------------------------------------------------------------------
+
+ipcMain.handle('desktop:profiles:list', async () => {
+  try {
+    await ensureProfilesDir();
+    const index = await readProfilesIndex();
+    return { ok: true, ...index };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:profiles:get', async (_event, payload) => {
+  try {
+    const id = payload?.id;
+    if (!validateProfileId(id)) {
+      return { ok: false, error: 'Invalid profile id' };
+    }
+
+    const profilePath = path.join(PROFILES_DIR, id, 'profile.json');
+    let raw;
+    try {
+      raw = await fs.readFile(profilePath, 'utf8');
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        return { ok: false, error: 'Profile not found' };
+      }
+      throw err;
+    }
+
+    const profile = migrateProfile(JSON.parse(raw));
+
+    // Check for avatar
+    const avatarPath = path.join(PROFILES_DIR, id, 'avatar.png');
+    let hasAvatar = false;
+    try {
+      await fs.access(avatarPath);
+      hasAvatar = true;
+    } catch (_e) { /* no avatar */ }
+
+    return { ok: true, profile, hasAvatar, avatarPath: hasAvatar ? avatarPath : null };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:profiles:save', async (_event, payload) => {
+  try {
+    const incoming = payload?.profile;
+    if (!incoming || typeof incoming !== 'object') {
+      return { ok: false, error: 'Invalid profile data' };
+    }
+
+    const sanitized = sanitizeProfilePayload(incoming);
+
+    if (!sanitized.name || sanitized.name.trim() === '') {
+      return { ok: false, error: 'Name is required' };
+    }
+
+    await ensureProfilesDir();
+    const index = await readProfilesIndex();
+
+    const isCreate = !sanitized.id || !index.profiles.find((p) => p.id === sanitized.id);
+
+    let profile;
+    if (isCreate) {
+      // Generate immutable ID
+      const id = generateProfileId();
+      sanitized.id = id;
+
+      // Load all existing profiles for deviceName collision check
+      const allProfiles = [];
+      for (const entry of index.profiles) {
+        try {
+          const p = JSON.parse(await fs.readFile(path.join(PROFILES_DIR, entry.id, 'profile.json'), 'utf8'));
+          allProfiles.push(p);
+        } catch (_e) { /* skip broken */ }
+      }
+
+      const deviceName = resolveDeviceName(sanitized, allProfiles);
+
+      profile = {
+        version: 1,
+        id,
+        name: sanitized.name.trim(),
+        deviceName,
+        deviceNameManuallySet: sanitized.deviceNameManuallySet || false,
+        systemPrompt: sanitized.systemPrompt || '',
+        workspace: sanitized.workspace || '',
+        model: sanitized.model || 'sonnet',
+        permissions: sanitized.permissions || 'dev-safe',
+        gatewayUrl: sanitized.gatewayUrl || '',
+        auditLogPath: sanitized.auditLogPath || '',
+        mcpServers: sanitized.mcpServers || '',
+        mcpFilesystemEnabled: sanitized.mcpFilesystemEnabled || false,
+        mcpFilesystemRoot: sanitized.mcpFilesystemRoot || '',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+
+      // Create profile directory
+      const profileDir = path.join(PROFILES_DIR, id);
+      await fs.mkdir(profileDir, { recursive: true });
+
+      // Write profile.json
+      await atomicWrite(path.join(profileDir, 'profile.json'), JSON.stringify(profile, null, 2));
+
+      // Update index
+      index.profiles.push({ id, name: profile.name, createdAt: profile.createdAt, updatedAt: profile.updatedAt });
+      if (!index.activeProfileId) {
+        index.activeProfileId = id;
+      }
+      await writeProfilesIndex(index);
+
+    } else {
+      // Update existing
+      const id = sanitized.id;
+      if (!validateProfileId(id)) {
+        return { ok: false, error: 'Invalid profile id' };
+      }
+
+      const profilePath = path.join(PROFILES_DIR, id, 'profile.json');
+      let existing;
+      try {
+        existing = migrateProfile(JSON.parse(await fs.readFile(profilePath, 'utf8')));
+      } catch (err) {
+        if (err && err.code === 'ENOENT') {
+          return { ok: false, error: 'Profile not found' };
+        }
+        throw err;
+      }
+
+      // Load all profiles for deviceName collision check
+      const allProfiles = [];
+      for (const entry of index.profiles) {
+        try {
+          const p = JSON.parse(await fs.readFile(path.join(PROFILES_DIR, entry.id, 'profile.json'), 'utf8'));
+          allProfiles.push(p);
+        } catch (_e) { /* skip broken */ }
+      }
+
+      // Merge: sanitized fields overwrite existing, but preserve id, createdAt
+      profile = {
+        ...existing,
+        ...sanitized,
+        id: existing.id,  // immutable
+        createdAt: existing.createdAt,  // server-controlled
+        updatedAt: Date.now(),  // server-controlled
+        version: existing.version,
+      };
+
+      // Resolve deviceName
+      profile.deviceName = resolveDeviceName(profile, allProfiles);
+
+      await atomicWrite(profilePath, JSON.stringify(profile, null, 2));
+
+      // Update index entry
+      const indexEntry = index.profiles.find((p) => p.id === id);
+      if (indexEntry) {
+        indexEntry.name = profile.name;
+        indexEntry.updatedAt = profile.updatedAt;
+      }
+      await writeProfilesIndex(index);
+    }
+
+    return { ok: true, profile };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:profiles:delete', async (_event, payload) => {
+  try {
+    const id = payload?.id;
+    if (!validateProfileId(id)) {
+      return { ok: false, error: 'Invalid profile id' };
+    }
+
+    // Delete safety: can't delete profile whose agent is running (keyed on profile.id)
+    if (agentProcess && agentState.launchConfig?.profileId === id) {
+      return { ok: false, error: 'Stop the agent before deleting this profile' };
+    }
+
+    const index = await readProfilesIndex();
+    const entryIdx = index.profiles.findIndex((p) => p.id === id);
+    if (entryIdx === -1) {
+      return { ok: false, error: 'Profile not found' };
+    }
+
+    // Remove directory
+    const profileDir = path.join(PROFILES_DIR, id);
+    try {
+      await fs.rm(profileDir, { recursive: true, force: true });
+    } catch (_e) { /* dir may not exist */ }
+
+    // Remove from index
+    index.profiles.splice(entryIdx, 1);
+    if (index.activeProfileId === id) {
+      index.activeProfileId = index.profiles.length > 0 ? index.profiles[0].id : null;
+    }
+    await writeProfilesIndex(index);
+
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:profiles:set-active', async (_event, payload) => {
+  try {
+    const id = payload?.id;
+    if (!validateProfileId(id)) {
+      return { ok: false, error: 'Invalid profile id' };
+    }
+
+    const index = await readProfilesIndex();
+    const exists = index.profiles.find((p) => p.id === id);
+    if (!exists) {
+      return { ok: false, error: 'Profile not found' };
+    }
+
+    index.activeProfileId = id;
+    await writeProfilesIndex(index);
+
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:profiles:pick-avatar', async (event, payload) => {
+  try {
+    const profileId = payload?.profileId;
+    if (!validateProfileId(profileId)) {
+      return { ok: false, error: 'Invalid profile id' };
+    }
+
+    const profileDir = path.join(PROFILES_DIR, profileId);
+    try {
+      await fs.access(profileDir);
+    } catch (_e) {
+      return { ok: false, error: 'Profile directory not found' };
+    }
+
+    const win = BrowserWindow.fromWebContents(event.sender) || undefined;
+    const result = await dialog.showOpenDialog(win, {
+      title: 'Select Avatar Image',
+      filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+      properties: ['openFile'],
+    });
+
+    if (result.canceled || !result.filePaths || result.filePaths.length === 0) {
+      return { ok: false, canceled: true };
+    }
+
+    const srcPath = result.filePaths[0];
+
+    // Validate file size
+    const stat = await fs.stat(srcPath);
+    if (stat.size > AVATAR_MAX_BYTES) {
+      return { ok: false, error: 'Image too large (max 2MB)' };
+    }
+
+    // Validate content via magic bytes
+    const fileBuffer = await fs.readFile(srcPath);
+    if (!checkAvatarMagicBytes(fileBuffer)) {
+      return { ok: false, error: 'Invalid image file' };
+    }
+
+    // Copy to profile dir as avatar.png
+    const destPath = path.join(profileDir, 'avatar.png');
+    await fs.writeFile(destPath, fileBuffer);
+
+    return { ok: true, avatarPath: destPath };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:profiles:migrate', async (_event, payload) => {
+  try {
+    const legacyState = payload?.legacyState;
+    if (!legacyState || typeof legacyState !== 'object') {
+      return { ok: false, error: 'Invalid legacy state' };
+    }
+
+    await ensureProfilesDir();
+    const index = await readProfilesIndex();
+
+    // Idempotent: if profiles already exist, skip migration
+    if (index.profiles.length > 0) {
+      return { ok: true, migrated: false, reason: 'Profiles already exist' };
+    }
+
+    // Backup legacy payload before processing
+    const backupPath = path.join(PROFILES_DIR, 'legacy-backup.json');
+    await atomicWrite(backupPath, JSON.stringify(legacyState, null, 2));
+
+    // Extract profile from legacy wizard state
+    const id = generateProfileId();
+    const name = legacyState.deviceName || legacyState.agentName || 'My Agent';
+    const now = Date.now();
+
+    const profile = {
+      version: 1,
+      id,
+      name,
+      deviceName: slugify(name),
+      deviceNameManuallySet: false,
+      systemPrompt: legacyState.systemPrompt || '',
+      workspace: legacyState.workspace || legacyState.defaultCwd || '',
+      model: legacyState.model || 'sonnet',
+      permissions: legacyState.permissionProfile || 'dev-safe',
+      gatewayUrl: legacyState.gatewayUrl || '',
+      auditLogPath: legacyState.auditLogPath || '',
+      mcpServers: '',
+      mcpFilesystemEnabled: legacyState.mcpFilesystemEnabled || false,
+      mcpFilesystemRoot: legacyState.mcpFilesystemRoot || '',
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    // Create profile directory and write
+    const profileDir = path.join(PROFILES_DIR, id);
+    await fs.mkdir(profileDir, { recursive: true });
+    await atomicWrite(path.join(profileDir, 'profile.json'), JSON.stringify(profile, null, 2));
+
+    // Update index
+    index.profiles.push({ id, name: profile.name, createdAt: now, updatedAt: now });
+    index.activeProfileId = id;
+    await writeProfilesIndex(index);
+
+    return { ok: true, migrated: true, profileId: id };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 });
 
