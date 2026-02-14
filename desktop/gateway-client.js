@@ -109,15 +109,19 @@ async function fetchIdentityKey(gatewayUrl, deviceId) {
  * Initialize a handshake (client-init).
  * POST /gateway/v1/sessions/{sessionId}/handshake/client-init
  */
-async function initHandshake(gatewayUrl, sessionId, handshakeId, deviceId, clientEphemeralPubKey, clientSessionNonce) {
+async function initHandshake(gatewayUrl, sessionId, handshakeId, deviceId, clientEphemeralPubKey, clientSessionNonce, conversationId = null) {
+  const body = {
+    handshake_id: handshakeId,
+    device_id: deviceId,
+    client_ephemeral_public_key: clientEphemeralPubKey,
+    client_session_nonce: clientSessionNonce,
+  };
+  if (typeof conversationId === 'string' && conversationId.trim()) {
+    body.conversation_id = conversationId.trim();
+  }
   return gatewayJson(`${gatewayUrl}/gateway/v1/sessions/${encodeURIComponent(sessionId)}/handshake/client-init`, {
     method: 'POST',
-    body: JSON.stringify({
-      handshake_id: handshakeId,
-      device_id: deviceId,
-      client_ephemeral_public_key: clientEphemeralPubKey,
-      client_session_nonce: clientSessionNonce,
-    }),
+    body: JSON.stringify(body),
   });
 }
 

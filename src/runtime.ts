@@ -22,6 +22,7 @@ export interface RuntimeOptions {
 interface RuntimeSession {
   sessionId: string;
   handshakeId: string;
+  conversationId?: string;
   establishedAt: string;
   keys: SessionKeys;
   claudeSessionId?: string;
@@ -139,6 +140,7 @@ function emitDesktopEvent(event: string, data: Record<string, unknown>): void {
 
 class AgentRuntime {
   private readonly sessions = new Map<string, RuntimeSession>();
+  private readonly conversationClaudeSessions = new Map<string, string>();
   private backoffMs: number;
 
   constructor(
@@ -324,8 +326,12 @@ class AgentRuntime {
     if (frameType === 'session.cancel') {
       const sessionId = firstString(parsed.session_id, parsed.sessionId);
       if (sessionId) {
+        const session = this.sessions.get(sessionId);
         this.sessions.delete(sessionId);
-        emitDesktopEvent('session.ended', { sessionId });
+        emitDesktopEvent('session.ended', {
+          sessionId,
+          conversationId: session?.conversationId,
+        });
       }
       sendJson(ws, {
         type: 'session.cancelled',
@@ -344,6 +350,7 @@ class AgentRuntime {
   private async handleHandshakeRequest(ws: WebSocket, frame: JsonRecord): Promise<void> {
     const sessionId = firstString(frame.session_id, frame.sessionId);
     const handshakeId = firstString(frame.handshake_id, frame.handshakeId);
+    const conversationId = firstString(frame.conversation_id, frame.conversationId) ?? undefined;
     const clientEphemeralPublicKey = firstString(frame.client_ephemeral_public_key, frame.clientEphemeralPublicKey);
     const clientSessionNonce = firstString(frame.client_session_nonce, frame.clientSessionNonce);
 
@@ -382,23 +389,27 @@ class AgentRuntime {
       });
 
       const establishedAt = new Date().toISOString();
+      const resumedClaudeSessionId =
+        conversationId ? this.conversationClaudeSessions.get(conversationId) : undefined;
       this.sessions.set(sessionId, {
         sessionId,
         handshakeId,
+        conversationId,
         establishedAt,
         keys: ack.sessionKeys,
-        claudeSessionId: undefined,
+        claudeSessionId: resumedClaudeSessionId,
         nextIncomingSeq: 1,
         nextOutgoingSeq: 1,
       });
 
-      emitDesktopEvent('session.started', { sessionId, handshakeId, establishedAt });
+      emitDesktopEvent('session.started', { sessionId, handshakeId, conversationId, establishedAt });
 
       sendJson(ws, {
         type: 'session.handshake.ack',
         status: 'ok',
         session_id: ack.sessionId,
         handshake_id: ack.handshakeId,
+        ...(conversationId ? { conversation_id: conversationId } : {}),
         agent_ephemeral_public_key: ack.agentEphemeralPublicKey,
         agent_identity_signature: ack.agentIdentitySignature,
         transcript_hash: ack.transcriptHash,
@@ -426,11 +437,13 @@ class AgentRuntime {
       sessionId: string;
       messageId: string;
       error: string;
+      conversationId?: string;
       session?: RuntimeSession;
       encrypted?: boolean;
     }
   ): void {
-    const { sessionId, messageId, error, session, encrypted } = params;
+    const { sessionId, messageId, error, conversationId, session, encrypted } = params;
+    const resolvedConversationId = conversationId ?? session?.conversationId;
 
     if (session && encrypted) {
       const seq = session.nextOutgoingSeq;
@@ -445,6 +458,7 @@ class AgentRuntime {
           error,
           message_id: messageId,
           session_id: sessionId,
+          ...(resolvedConversationId ? { conversation_id: resolvedConversationId } : {}),
         }),
         aadBase64: aad,
       });
@@ -455,6 +469,7 @@ class AgentRuntime {
         type: 'session.error',
         session_id: sessionId,
         message_id: messageId,
+        ...(resolvedConversationId ? { conversation_id: resolvedConversationId } : {}),
         encrypted: true,
         handshake_id: session.handshakeId,
         ...encryptedPayload,
@@ -466,6 +481,7 @@ class AgentRuntime {
       type: 'session.error',
       session_id: sessionId,
       message_id: messageId,
+      ...(resolvedConversationId ? { conversation_id: resolvedConversationId } : {}),
       error,
     });
   }
@@ -502,6 +518,7 @@ class AgentRuntime {
     let encryptedRequest = false;
     let prompt: string | null;
     let cwd: string;
+    let conversationId = firstString(frame.conversation_id, frame.conversationId) ?? session.conversationId;
     const requesterUID = firstString(frame.requester_uid, frame.requesterUid, frame.user_id, frame.userId) ?? 'unknown';
     const receivedAt = firstString(frame.received_at, frame.receivedAt) ?? new Date().toISOString();
 
@@ -611,6 +628,10 @@ class AgentRuntime {
       if (payloadMessageId) {
         messageId = payloadMessageId;
       }
+      const payloadConversationId = firstString(decryptedPayload.conversation_id, decryptedPayload.conversationId);
+      if (payloadConversationId) {
+        conversationId = payloadConversationId;
+      }
 
       prompt = firstString(
         decryptedPayload.prompt,
@@ -631,8 +652,20 @@ class AgentRuntime {
         payload?.text,
         payload?.message
       );
+      const payloadConversationId = firstString(payload?.conversation_id, payload?.conversationId);
+      if (payloadConversationId) {
+        conversationId = payloadConversationId;
+      }
 
       cwd = firstString(frame.cwd, payload?.cwd) ?? this.options.defaultCwd;
+    }
+
+    if (conversationId) {
+      session.conversationId = conversationId;
+      const mappedClaudeSessionId = this.conversationClaudeSessions.get(conversationId);
+      if (mappedClaudeSessionId && session.claudeSessionId !== mappedClaudeSessionId) {
+        session.claudeSessionId = mappedClaudeSessionId;
+      }
     }
 
     if (!prompt) {
@@ -667,6 +700,7 @@ class AgentRuntime {
 
     emitDesktopEvent('session.message', {
       sessionId,
+      conversationId,
       messageId,
       requesterUid: requesterUID,
       prompt,
@@ -695,6 +729,7 @@ class AgentRuntime {
         type: 'session.progress',
         session_id: sessionId,
         message_id: messageId,
+        ...(conversationId ? { conversation_id: conversationId } : {}),
         encrypted: true,
         handshake_id: session.handshakeId,
         ...encryptedPayload,
@@ -704,6 +739,7 @@ class AgentRuntime {
         type: 'session.progress',
         session_id: sessionId,
         message_id: messageId,
+        ...(conversationId ? { conversation_id: conversationId } : {}),
         status: 'running',
       });
     }
@@ -720,10 +756,14 @@ class AgentRuntime {
       });
       if (result.sessionId) {
         session.claudeSessionId = result.sessionId;
+        if (conversationId) {
+          this.conversationClaudeSessions.set(conversationId, result.sessionId);
+        }
       }
 
       emitDesktopEvent('session.result', {
         sessionId,
+        conversationId,
         messageId,
         result: typeof result.result === 'string' ? result.result : '',
         turns: result.turns,
@@ -757,6 +797,7 @@ class AgentRuntime {
           type: 'session.result',
           session_id: sessionId,
           message_id: messageId,
+          ...(conversationId ? { conversation_id: conversationId } : {}),
           encrypted: true,
           handshake_id: session.handshakeId,
           ...encryptedPayload,
@@ -768,6 +809,7 @@ class AgentRuntime {
         type: 'session.result',
         session_id: sessionId,
         message_id: messageId,
+        ...(conversationId ? { conversation_id: conversationId } : {}),
         result: result.result,
         turns: result.turns,
         cost_usd: result.costUsd,
@@ -776,7 +818,7 @@ class AgentRuntime {
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      emitDesktopEvent('session.error', { sessionId, messageId, error: msg });
+      emitDesktopEvent('session.error', { sessionId, conversationId, messageId, error: msg });
       this.sendSessionError(ws, {
         sessionId,
         messageId,

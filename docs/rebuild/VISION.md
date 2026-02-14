@@ -2,57 +2,59 @@
 
 ## Executive Summary
 
-The Commands.com Desktop app is being rebuilt from a setup wizard into an **agent network client** — a persistent hub where users manage their own AI agents, connect to agents shared by others, and orchestrate agent-to-agent conversations. The app becomes the primary interface for the Commands.com ecosystem, replacing the browser for power users while the web UI remains the zero-friction entry point for new and casual users.
+The Commands.com Desktop app has moved from a setup wizard toward an **agent network client** — a persistent hub where users manage their own AI agents, connect to agents shared by others, and orchestrate agent-to-agent conversations. The app is becoming the primary interface for the Commands.com ecosystem, while the web UI remains the zero-friction entry point for new and casual users.
 
 The viral feature: **watch two AI agents talk to each other.** Users give each agent a persona, point them at each other, and observe the conversation unfold in real time. This transforms Commands.com from "infrastructure for developers" into "something anyone wants to try."
 
 ---
 
-## Current State (v0.1.0)
+## Current State (Feb 2026 Snapshot)
 
 ### What exists today
 
-The desktop app is a **5-step setup wizard** for configuring and launching a local agent:
+The desktop app now runs as a **hub UI** (not a wizard-first experience) with shipped support for:
 
-| Step | Purpose |
-|------|---------|
-| 1. Agent Profiles | Name, device name, workspace path, model (opus/sonnet/haiku), permissions (read-only/dev-safe/full) |
-| 2. MCP Modules | Toggle 5 hardcoded MCPs (Filesystem, GitHub, Postgres, Playwright, Slack) with per-module config |
-| 3. Run & Validate | Start/stop agent, view real-time logs, configure gateway URL |
-| 4. Review | Summary view, export JSON, bootstrap command |
-| 5. Audit Trail | Search and filter audit.log entries |
+1. **My Agents** management (profiles, start/stop, logs, audit trail, settings).
+2. **Shared With Me** sidebar and chat view.
+3. **Gateway OAuth sign-in** in system browser (PKCE + localhost callback), managed in main process.
+4. **Gateway REST + SSE integration** for device discovery, status updates, session events.
+5. **E2E shared chat sessions** (X25519 ECDH + HKDF + AES-256-GCM) in main process.
+6. **Renderer hardening**: sandbox enabled, strict context isolation, renderer CSP, sanitized markdown pipeline, safe external URL allowlist.
 
 ### Current architecture
 
 ```
 desktop/
-├── main.js           # Electron main process (agent lifecycle, IPC, credential security)
-├── preload.js        # IPC bridge (contextBridge)
-├── package.json
+├── main.js              # Electron main process (agent lifecycle, IPC, gateway wiring, policy checks)
+├── preload.js           # Strict IPC bridge (no token/key exposure)
+├── auth.js              # Gateway OAuth + refresh + secure local token storage
+├── gateway-client.js    # REST/SSE client (origin allowlist, retry, dedup, resume)
+├── crypto.js            # E2E crypto helpers
+├── session-manager.js   # Handshake/session state machine + encrypted messaging
 └── renderer/
-    ├── index.html    # Shell: topbar + sidebar + wizard panels
-    ├── app.js        # All wizard logic (~1600 lines)
-    └── styles.css    # Dark theme (~680 lines)
+    ├── app.js
+    ├── state.js
+    ├── components/sidebar.js
+    ├── views/agent-detail.js
+    ├── views/agent-chat.js
+    ├── views/agent-create.js
+    └── styles/*
 ```
 
-- **Storage**: Browser `localStorage` (`commands.desktop.setupWizard.v1`)
-- **Agent launch**: Spawns `./start-agent.sh` with environment variables
-- **Credential security**: Electron `safeStorage` encrypts sensitive fields at rest
-- **No chat interface** — conversations only visible in audit trail or web UI
-- **No awareness of shared agents** — the app only knows about local agents
-- **No user-level gateway API access in the UI** — the agent process authenticates via OAuth to the gateway and holds its own JWT, but the desktop UI/renderer has no auth context of its own. The UI cannot make authenticated REST calls or subscribe to SSE events on behalf of the user (needed for fetching shares, sending chat messages, monitoring live conversations).
+Storage and runtime facts:
 
-### What's missing
+- Profiles/settings live on disk under `~/.commands-agent/*`.
+- Desktop auth state is encrypted at rest via Electron `safeStorage`.
+- Gateway auth/network/crypto operations run in **main process only**.
+- Renderer receives plaintext event payloads and action results only.
 
-1. No chat interface for talking to agents
-2. No visibility into who's using your agent right now
-3. No way to connect to other people's agents
-4. No agent-to-agent capability
-5. Agent profiles are configuration, not characters
-6. MCP selection is hardcoded to 5 options
-7. The wizard dominates the UI — there's no "home" state
-8. No Firebase auth integration in the desktop app
-9. No real-time event stream from the gateway
+### Current gaps (active roadmap items)
+
+1. Agent naming is still effectively global in some flows (no owner-scoped namespacing yet).
+2. Live conversations and audit still show requester UID in many views (email/display enrichment pending).
+3. Desktop runtime is still single-local-agent (`agentProcess` singleton).
+4. Share link creation/consumption is not fully integrated in desktop UI.
+5. Agent-to-agent orchestration loop is not shipped yet.
 
 ---
 
@@ -70,8 +72,8 @@ The app is a **persistent agent hub** — always running, always connected. User
 │  MY AGENTS       │         Chat / Agent Detail View                │
 │  ┌────────────┐  │                                                  │
 │  │ 🟢 CodeBot │💬│  Messages render in real time as remote users   │
-│  │    Agent 1  │  │  interact with your agent. Full markdown        │
-│  └────────────┘  │  rendering with code blocks, images, etc.       │
+│  │    Agent 1  │  │  interact with your agent. Markdown supports    │
+│  └────────────┘  │  code blocks + safe links; external media blocked │
 │  ┌────────────┐  │                                                  │
 │  │ ⚫ Helper  │  │  ┌─────────────────────────────────────────┐    │
 │  │    Agent 2  │  │  │ Sarah (remote user):                    │    │
@@ -126,10 +128,10 @@ Two sections, each scrollable independently:
   - Owner name or email (subtle, below agent name)
   - Online/offline status (green = agent is running and reachable)
 - Click an agent → main panel shows chat interface for that agent
-- Entries auto-populate from gateway share grants (via `/api/gateway/shares/devices/:deviceId/grants` on app backend, or SSE events from relay)
+- Entries auto-populate from gateway device discovery (`GET /gateway/v1/devices`, shared/granted entries) and device status SSE events
 
 **Sidebar footer**
-- User avatar + email (from Firebase auth)
+- User avatar + email (from desktop gateway auth session)
 - Settings gear icon
 - Connection status indicator (connected to gateway / offline)
 
@@ -268,6 +270,8 @@ Profiles are stored on disk (not localStorage) for persistence and portability:
   "updatedAt": "2025-01-20T14:30:00Z"
 }
 ```
+
+Agent install location is a **global desktop setting**, not a per-profile field.
 
 ### 3. MCP Servers (Custom JSON Support)
 
@@ -801,27 +805,27 @@ The product works as a free toy (Ollama) and as a professional tool (Claude) in 
 
 #### Two principals, two tokens
 
-The system maintains **separate auth principals** for security:
+The system maintains separate principals for blast-radius control:
 
 | Principal | Token | Scope | Used by |
 |-----------|-------|-------|---------|
-| **User** | Firebase token | Control-plane: shares, subscriptions, user settings, SSE events | Desktop UI |
-| **Device** | Device JWT | Data-plane: relay connection, message routing, device lifecycle | Agent process |
+| **Desktop user principal** | Gateway OAuth access/refresh tokens | Desktop control-plane and shared-chat client calls | Desktop main process |
+| **Agent device principal** | Device JWT | Agent relay connection, device lifecycle, runtime frames | Agent process |
 
-**Why separate?** If a device JWT is compromised (e.g., machine stolen), the attacker can only relay messages as that device — they cannot manage shares, change subscriptions, or access other user-level APIs. The blast radius is contained to one device. Revoking the device token kills its relay access without affecting the user's account.
+If a device token is compromised, impact is scoped to that device runtime. Desktop user token handling remains isolated in desktop main process.
 
-#### Approach: Capture Firebase token during existing OAuth
+#### Current desktop auth flow (implemented)
 
-The agent's OAuth flow (`oauth.ts`) already opens a browser for Firebase sign-in. During this flow:
+Desktop uses gateway OAuth 2.0 with PKCE:
 
-1. The user authenticates via Firebase in the browser
-2. The gateway receives the Firebase token, verifies it, and issues a device JWT
-3. **New**: The OAuth callback also returns the Firebase refresh token
-4. The desktop app stores both tokens via `safeStorage`:
-   - Device JWT → used by agent process for relay
-   - Firebase refresh token → used by desktop UI for control-plane APIs
+1. Start localhost callback server on random port.
+2. Open system browser to `{gatewayUrl}/oauth/authorize`.
+3. User authenticates in browser (Google/Firebase handled by gateway).
+4. Gateway redirects to `http://localhost:{port}/callback?code=...&state=...`.
+5. Desktop exchanges code at `{gatewayUrl}/oauth/token`.
+6. Desktop stores refresh token securely (encrypted at rest), keeps access token in memory with refresh singleflight.
 
-This means: **no second sign-in**. The user authenticates once during agent setup. The desktop UI gets a Firebase refresh token for user-level API calls, and the agent gets its device JWT for relay operations.
+No Firebase JS SDK is loaded in the desktop renderer. No embedded auth BrowserWindow flow is required.
 
 #### Token handling in Electron
 
@@ -832,16 +836,16 @@ All authenticated network requests are performed by the **main process**. The re
 ```
 Renderer                    Main Process                    External API
    │                            │                                │
-   │── api:fetch-shares() ─────►│                                │
+   │── gateway:fetchDevices() ─►│                                │
    │                            │── read token from safeStorage  │
    │                            │── decrypt + validate           │
-   │                            │── GET /api/gateway/shares ────►│
+   │                            │── GET /gateway/v1/devices ────►│
    │                            │◄── response ──────────────────│
-   │◄── { shares: [...] } ─────│                                │
+   │◄── { devices: [...] } ────│                                │
    │                            │                                │
 ```
 
-- Renderer calls action-specific IPC methods (e.g., `commandsDesktop.api.fetchShares()`, `commandsDesktop.api.sendMessage()`)
+- Renderer calls action-specific IPC methods (e.g., `commandsDesktop.gateway.fetchDevices()`, `commandsDesktop.gateway.sendMessage()`)
 - Main process attaches auth headers, makes the HTTP call, returns only the response data
 - If token needs refresh, main process handles it transparently before retrying
 - If renderer process is compromised, attacker cannot extract tokens or make arbitrary authenticated requests
@@ -852,18 +856,16 @@ The app supports two modes based on auth state:
 
 | Mode | Auth required | Features available |
 |------|--------------|-------------------|
-| **Local-only** | None | Create agents, run with Ollama, local conversations, audit trail |
-| **Networked** | Firebase sign-in (one-time) | Everything: shares, remote access, agent-to-agent via relay, subscriptions |
-
-Local-only mode is the zero-friction entry point for Ollama users. They can create agents and have agent-to-agent conversations locally (both agents on the same machine, communicating directly without the relay). When they want to share an agent with someone else, they sign in — and that's when the Firebase token is captured.
+| **Local-only** | None | Profile management, local agent runtime, logs/audit, local workflows |
+| **Networked** | Gateway OAuth sign-in | Shared agent discovery/chat, gateway status SSE, encrypted relay sessions |
 
 #### Token management
 
-- Firebase refresh token and device JWT encrypted at rest via `safeStorage`
-- Main process refreshes Firebase token automatically (1-hour expiry)
-- If refresh fails: prompt user to re-authenticate (rare — refresh tokens are long-lived)
-- Device JWT refreshed by agent's existing renewal flow
-- Offline mode: local agent management and Ollama conversations work, gateway features unavailable
+- Desktop refresh token encrypted at rest via `safeStorage`; access token held in memory.
+- Main process refreshes access token automatically and serializes concurrent refresh attempts.
+- Invalid/expired refresh paths fail closed and require re-authentication.
+- Device JWT lifecycle remains managed by agent runtime.
+- Offline mode preserves local agent management; gateway-backed features are unavailable.
 
 ### 12. Settings
 
@@ -871,6 +873,7 @@ Accessible from sidebar footer gear icon.
 
 | Setting | Description |
 |---------|-------------|
+| **Agent Install Root** | Global location of the local agent runtime used by all profiles (configured once in desktop settings, not per-agent). |
 | **Gateway URL** | Default: `https://api.commands.com`. Advanced users can point to self-hosted. |
 | **Audit Log Path** | Where to write audit logs. Default: `~/.commands-agent/audit.log` |
 | **Theme** | Dark (default), Light, System |
@@ -883,49 +886,44 @@ Accessible from sidebar footer gear icon.
 
 #### API surfaces
 
-The desktop app interacts with two backends:
+Current desktop network path is gateway-first:
 
 | Backend | Base URL | Namespace | Purpose |
 |---------|----------|-----------|---------|
-| **Gateway relay** (Go/Fiber) | `api.commands.com` | `/gateway/v1/*` | Relay, sessions, device lifecycle, SSE events |
-| **App backend** (Express) | `commands.com` | `/api/gateway/*` | Shares, subscriptions, user management |
+| **Gateway** (Go/Fiber) | `api.commands.com` | `/oauth/*`, `/gateway/v1/*` | OAuth, devices, sessions, relay, SSE |
+| **App backend** (future/optional) | `commands.com` | `/api/gateway/*` | Share links, subscription and account surfaces |
 
 #### SSE event stream (gateway relay)
 
 ```
 GET /gateway/v1/devices/events
-Authorization: Bearer <firebase-token>
+Authorization: Bearer <gateway-access-token>
 ```
 
 **Current events** (implemented today):
 - `device.status` — an agent went online/offline (includes device ID, status, timestamp)
-
-**New events needed** (to be added to the relay for desktop app):
-- `session.created` — a remote user started a chat session with one of your agents
-- `session.ended` — a chat session ended
+- Per-session SSE for chat sessions via `GET /gateway/v1/sessions/:session_id/events`
 
 Note: live conversation content (individual messages) is NOT delivered via this SSE stream. Owner monitoring of message content comes from local IPC with the agent process (see §5 E2E encryption section). This keeps the relay zero-knowledge about message content.
 
 #### REST API calls
 
-**Gateway relay** (`api.commands.com`) — all endpoints use **Firebase auth** unless noted:
+**Gateway** (`api.commands.com`) — desktop calls use gateway OAuth bearer token unless noted:
 
 | Endpoint | Auth | Purpose |
 |----------|------|---------|
-| `GET /gateway/v1/devices` | Firebase | List registered devices and status |
-| `GET /gateway/v1/devices/events` | Firebase | SSE stream for device/session events |
-| `DELETE /gateway/v1/devices/:device_id` | Firebase | Remove a device |
-| `POST /gateway/v1/devices/:device_id/revoke` | Firebase | Revoke device token |
-| `GET /gateway/v1/devices/:device_id/identity-key` | Firebase | Get agent's public key for E2E handshake |
+| `GET /gateway/v1/devices` | Desktop user token | List devices the signed-in user can access |
+| `GET /gateway/v1/devices/events` | Desktop user token | SSE device status stream |
+| `GET /gateway/v1/devices/:device_id/identity-key` | Desktop user token | Fetch agent identity key for handshake verification |
 | `PUT /gateway/v1/devices/:device_id/identity-key` | **Device JWT** | Agent registers/updates its identity key |
-| `POST /gateway/v1/sessions/:session_id/handshake/client-init` | Firebase | Client initiates E2E key exchange |
+| `POST /gateway/v1/sessions/:session_id/handshake/client-init` | Desktop user token | Start E2E handshake |
 | `POST /gateway/v1/sessions/:session_id/handshake/agent-ack` | **Device JWT** | Agent acknowledges handshake |
-| `GET /gateway/v1/sessions/:session_id/handshake/:handshake_id` | Firebase | Poll handshake status |
-| `POST /gateway/v1/sessions/:session_id/messages` | Firebase | Send encrypted message |
-| `GET /gateway/v1/sessions/:session_id/events` | Firebase | SSE stream for a specific session |
+| `GET /gateway/v1/sessions/:session_id/handshake/:handshake_id` | Desktop user token | Poll handshake status |
+| `POST /gateway/v1/sessions/:session_id/messages` | Desktop user token | Send encrypted message |
+| `GET /gateway/v1/sessions/:session_id/events` | Desktop user token | SSE stream for one chat session |
 | `GET /gateway/v1/agent/connect` | **Device JWT** | Agent WebSocket relay connection |
 
-**App backend** (`commands.com`) — all endpoints use **Firebase auth**:
+**App backend** (`commands.com`) — share/subscription flows are planned/optional in desktop:
 
 | Endpoint | Purpose |
 |----------|---------|
@@ -946,66 +944,23 @@ For monitoring conversations on your own agents, the desktop app reads from a **
 
 ## Implementation Phases
 
-### Phase 1: Hub Shell & Auth (Foundation)
+### Delivery Status (as of Feb 2026)
 
-**Goal**: Replace the wizard with the hub layout. Users can sign in and see their agents.
+| Phase | Status | Notes |
+|------|--------|-------|
+| **Phase 1: Hub Shell & Auth** | ✅ Mostly complete | Hub layout shipped, profiles on disk, gateway OAuth in desktop main process |
+| **Phase 2: Enhanced Profiles & MCP** | 🟡 Partial | Core profile editing exists; character-centric polish and MCP UX still evolving |
+| **Phase 3: Live Conversations & Shared Agents** | ✅ Core complete | Shared With Me list, chat UI, E2E sessions, gateway SSE are functional |
+| **Phase 4: Agent-to-Agent** | ⏳ Not shipped | Spec complete, implementation pending |
+| **Phase 5: Polish & Viral** | ⏳ Not shipped | Post-foundation quality and growth features remain |
 
-- New `renderer/` structure with component-based architecture
-- Hub layout: sidebar + main panel
-- Firebase auth integration (browser-based OAuth → deep link callback)
-- Agent profiles migrated from localStorage to disk (`~/.commands-agent/profiles/`)
-- "My Agents" sidebar section with start/stop/status
-- Agent detail view (header + log output, replacing Step 3)
-- "Create Agent" flow as modal/panel (replacing Steps 1-2)
+### Next Milestone Priorities
 
-**Carries forward from current app**: Agent lifecycle management, credential security, audit trail.
-
-### Phase 2: Enhanced Profiles & MCP
-
-**Goal**: Agent profiles become characters. MCP configuration becomes open.
-
-- System prompt field with editor
-- Avatar upload + storage
-- Knowledge files directory support
-- Agent templates
-- Custom MCP JSON editor
-- Per-profile MCP configuration
-- Profile import/export
-
-### Phase 3: Live Conversations & Shared Agents
-
-**Goal**: Users can see live conversations on their agents and chat with shared agents.
-
-- SSE integration with gateway for real-time events
-- Live conversation feed on "My Agent" detail view
-- "Shared With Me" sidebar section (auto-populated from gateway)
-- Chat interface for shared agents
-- Markdown message rendering
-- E2E encryption integration (key exchange, message encrypt/decrypt)
-- Message history persistence (local, encrypted at rest)
-
-### Phase 4: Agent-to-Agent
-
-**Goal**: Users can delegate conversations to their own agents.
-
-- 🤖 delegation button and panel
-- Orchestrator logic: receive response → feed to local agent → send reply
-- Auto mode UI (status bar, pause/stop/edit controls)
-- Manual intervention during auto mode
-- Turn limits and auto-stop conditions
-- Conversation export (save agent-to-agent transcripts)
-
-### Phase 5: Polish & Viral Features
-
-**Goal**: Make it delightful and shareable.
-
-- System tray integration with notifications
-- Typing indicators and streaming message display
-- Conversation sharing (export as image, markdown, or link)
-- Agent gallery (browse public agent profiles — future)
-- Auto-start on login
-- Performance optimization (virtualized message lists, lazy loading)
-- Onboarding flow for first-time users
+1. Namespaced agent names (owner-scoped uniqueness).
+2. Requester identity enrichment (email/display in live + audit).
+3. Multi-agent local runtime (remove singleton process model).
+4. Share link create/consume flow in desktop UI.
+5. Agent-to-agent orchestration loop in shared chat.
 
 ---
 
@@ -1013,85 +968,63 @@ For monitoring conversations on your own agents, the desktop app reads from a **
 
 ### Renderer architecture
 
-The current `app.js` is a single 1600-line file with all wizard logic. The rebuild should use a **component-based architecture** — not necessarily React (Electron apps don't need a full framework), but at minimum:
+Renderer is now modularized and routed through `app.js` with split views/components/state.
 
-- Separate JS modules per view/component
-- A simple router for sidebar navigation
-- Shared utilities (markdown renderer, API client, crypto)
-- CSS modules or scoped styles per component
+Current structure (implemented):
 
-Suggested structure:
 ```
 renderer/
 ├── index.html
-├── app.js                    # Entry point, router, global state
+├── app.js                    # Router + view orchestration
+├── state.js                  # Shared app/chat/auth state
 ├── styles/
-│   ├── base.css              # Variables, reset, typography
-│   ├── layout.css            # Hub layout, sidebar, panels
-│   ├── chat.css              # Chat interface styles
-│   └── components.css        # Buttons, inputs, cards, modals
+│   ├── base.css
+│   ├── layout.css
+│   ├── chat.css
+│   └── components.css
 ├── views/
-│   ├── dashboard.js          # Default/welcome view
-│   ├── agent-detail.js       # My agent detail + live conversations + audit trail
-│   ├── agent-chat.js         # Shared agent chat interface
-│   ├── agent-create.js       # Agent creation flow
-│   ├── agent-edit.js         # Agent profile editor
-│   └── settings.js           # App settings
+│   ├── dashboard.js
+│   ├── agent-detail.js
+│   ├── agent-chat.js
+│   ├── agent-create.js
+│   └── settings.js
 ├── components/
-│   ├── sidebar.js            # Sidebar with agent lists
-│   ├── chat-renderer.js      # Markdown message rendering
-│   ├── message-input.js      # Chat input with send/delegate buttons
-│   ├── delegation-panel.js   # Agent-to-agent delegation UI
-│   ├── agent-card.js         # Sidebar agent entry
-│   ├── status-indicator.js   # Online/offline/error indicators
-│   └── modal.js              # Reusable modal/panel component
-├── services/
-│   ├── api.js                # Gateway REST API client
-│   ├── sse.js                # SSE event stream manager
-│   ├── auth.js               # Firebase auth + token management
-│   ├── crypto.js             # E2E encryption (key exchange, encrypt/decrypt)
-│   ├── profiles.js           # Profile CRUD (reads/writes via IPC)
-│   └── state.js              # Global app state management
-└── lib/
-    ├── markdown.js           # Markdown → HTML renderer
-    └── utils.js              # Helpers
+│   └── sidebar.js
+└── markdown.js               # Renderer markdown helpers
 ```
+
+Remaining architecture goals:
+
+- Further reduce cross-view coupling in `state.js`.
+- Keep all auth/network/crypto logic in main process.
+- Maintain sandbox-compatible renderer APIs only.
 
 ### IPC additions (preload.js)
 
-New IPC handlers needed beyond current:
+Current primary IPC surfaces:
 
 ```javascript
-// Profile management
-'desktop:profiles:list'          // List all profiles
-'desktop:profiles:get'           // Get single profile
-'desktop:profiles:save'          // Create or update profile
-'desktop:profiles:delete'        // Delete profile
-'desktop:profiles:pick-avatar'   // File dialog for avatar image
+// Profiles + local runtime
+'desktop:profiles:*'
+'desktop:agent:start'
+'desktop:agent:stop'
+'desktop:agent:status'
+'desktop:agent-log'               // push event
+'desktop:conversation-event'      // push event
 
-// Auth (no token exposure — main process holds all credentials)
-'desktop:auth:status'            // Returns { signedIn, email, mode } — no tokens
-'desktop:auth:sign-in'           // Opens browser OAuth flow
-'desktop:auth:sign-out'          // Sign out, clear stored tokens
+// Auth (main-process only token handling)
+'desktop:auth:sign-in'
+'desktop:auth:sign-out'
+'desktop:auth:status'
+'desktop:auth-changed'            // push event
 
-// Gateway API (main process performs all HTTP calls with auth)
-'desktop:api:fetch-shares'       // GET shares — returns response data only
-'desktop:api:create-invite'      // POST invite — returns response data only
-'desktop:api:accept-invite'      // POST accept — returns response data only
-'desktop:api:revoke-grant'       // POST revoke — returns response data only
-'desktop:api:fetch-subscription' // GET subscription — returns response data only
-'desktop:api:fetch-devices'      // GET devices — returns response data only
-
-// Gateway relay (main process manages connections + encryption)
-'desktop:relay:connect-sse'      // Start SSE connection (main process manages)
-'desktop:relay:disconnect-sse'   // Stop SSE connection
-'desktop:relay:send-message'     // Encrypt + send message (main process handles crypto)
-'desktop:relay:start-session'    // Initiate E2E handshake with remote agent
-
-// Delegation
-'desktop:delegate:start'         // Start agent-to-agent delegation
-'desktop:delegate:stop'          // Stop delegation
-'desktop:delegate:status'        // Get delegation status
+// Gateway shared-chat APIs
+'desktop:gateway:devices'
+'desktop:gateway:start-session'
+'desktop:gateway:send-message'
+'desktop:gateway:end-session'
+'desktop:gateway-device-event'    // push event
+'desktop:gateway-chat-event'      // push event
 ```
 
 ### Encryption in the desktop app

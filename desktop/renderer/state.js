@@ -368,7 +368,7 @@ export function processChatEvent(event) {
 
   let chat = chatState.get(deviceId);
   if (!chat) {
-    chat = { status: 'idle', messages: [] };
+    chat = { status: 'idle', messages: [], conversationId: null };
     chatState.set(deviceId, chat);
   }
 
@@ -378,6 +378,12 @@ export function processChatEvent(event) {
       chat.status = 'handshaking';
       break;
     case 'session.ready':
+      // Same conversationId = agent resumes its Claude session with full context,
+      // so prior messages are still valid. Different conversationId = fresh start.
+      if (event.conversationId && chat.conversationId && event.conversationId !== chat.conversationId) {
+        chat.messages = [];
+      }
+      chat.conversationId = event.conversationId || chat.conversationId;
       chat.status = 'ready';
       break;
     case 'session.ended':

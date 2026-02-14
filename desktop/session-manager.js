@@ -31,12 +31,15 @@ const MAX_MESSAGE_LENGTH = 100_000;
 const sessions = new Map();
 /** @type {Map<string, Promise<unknown>>} deviceId → serialized send chain */
 const sendQueues = new Map();
+/** @type {Map<string, string>} deviceId → conversationId */
+const deviceConversationIds = new Map();
 
 /**
  * @typedef {Object} SessionState
  * @property {string} deviceId
  * @property {string} sessionId
  * @property {string} handshakeId
+ * @property {string} conversationId
  * @property {'handshaking'|'ready'|'ending'|'ended'|'error'} status
  * @property {{ clientToAgent: Buffer, agentToClient: Buffer, control: Buffer }|null} keys
  * @property {number} nextOutgoingSeq
@@ -126,6 +129,10 @@ function runSerializedSend(deviceId, task) {
   return run;
 }
 
+function generateConversationId() {
+  return `conv_${crypto.generateSessionId()}`;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -157,6 +164,7 @@ async function startSession(gatewayUrl, deviceId) {
   // Generate session identifiers and ephemeral keys
   const sessionId = crypto.generateSessionId();
   const handshakeId = crypto.generateHandshakeId();
+  const conversationId = deviceConversationIds.get(deviceId) || generateConversationId();
   const ephemeral = crypto.generateEphemeralX25519();
   const clientNonce = crypto.generateSessionNonce();
 
@@ -165,6 +173,7 @@ async function startSession(gatewayUrl, deviceId) {
     deviceId,
     sessionId,
     handshakeId,
+    conversationId,
     status: 'handshaking',
     keys: null,
     nextOutgoingSeq: 1,
@@ -175,8 +184,9 @@ async function startSession(gatewayUrl, deviceId) {
     error: null,
   };
   sessions.set(deviceId, session);
+  deviceConversationIds.set(deviceId, conversationId);
 
-  emitChatEvent({ type: 'session.handshaking', deviceId, sessionId });
+  emitChatEvent({ type: 'session.handshaking', deviceId, sessionId, conversationId });
 
   try {
     // Fetch agent's Ed25519 identity key for signature verification
@@ -187,14 +197,19 @@ async function startSession(gatewayUrl, deviceId) {
     }
 
     // POST client-init handshake
-    await gateway.initHandshake(
+    const initResp = await gateway.initHandshake(
       gatewayUrl,
       sessionId,
       handshakeId,
       deviceId,
       ephemeral.publicKeyRawBase64,
-      clientNonce
+      clientNonce,
+      conversationId
     );
+    if (typeof initResp?.conversation_id === 'string' && initResp.conversation_id.trim()) {
+      session.conversationId = initResp.conversation_id.trim();
+      deviceConversationIds.set(deviceId, session.conversationId);
+    }
 
     // Poll for agent acknowledgment
     const startTime = Date.now();
@@ -236,11 +251,22 @@ async function startSession(gatewayUrl, deviceId) {
         break;
       }
 
+      if (poll.status === 'agent_error') {
+        const reason = typeof poll.last_error === 'string' && poll.last_error.trim()
+          ? poll.last_error.trim()
+          : 'unknown agent handshake error';
+        throw new Error(`Handshake rejected by agent: ${reason}`);
+      }
+
       await sleepWithAbort(HANDSHAKE_POLL_INTERVAL_MS, session.handshakeAbortController?.signal);
     }
 
     if (!ackData) {
       throw new Error('Handshake timed out — agent did not acknowledge');
+    }
+    if (typeof ackData?.conversation_id === 'string' && ackData.conversation_id.trim()) {
+      session.conversationId = ackData.conversation_id.trim();
+      deviceConversationIds.set(deviceId, session.conversationId);
     }
 
     // Verify session hasn't been cancelled during polling
@@ -313,16 +339,16 @@ async function startSession(gatewayUrl, deviceId) {
       if (isHttpStatus(err, 404)) {
         s.status = 'error';
         s.error = 'Session expired';
-        emitChatEvent({ type: 'session.error', deviceId, error: 'Session expired — will reconnect on next message' });
+        emitChatEvent({ type: 'session.error', deviceId, error: 'Session expired — will reconnect on next message', conversationId: s.conversationId });
       } else {
         s.status = 'error';
         s.error = err instanceof Error ? err.message : String(err);
-        emitChatEvent({ type: 'session.error', deviceId, error: 'Connection to agent was lost — reconnect to continue' });
+        emitChatEvent({ type: 'session.error', deviceId, error: 'Connection to agent was lost — reconnect to continue', conversationId: s.conversationId });
       }
     });
 
-    emitChatEvent({ type: 'session.ready', deviceId, sessionId });
-    return { ok: true, sessionId, deviceId };
+    emitChatEvent({ type: 'session.ready', deviceId, sessionId, conversationId: session.conversationId });
+    return { ok: true, sessionId, deviceId, conversationId: session.conversationId };
   } catch (err) {
     session.handshakeAbortController = null;
     const current = sessions.get(deviceId);
@@ -330,7 +356,7 @@ async function startSession(gatewayUrl, deviceId) {
       cleanupSessionResources(session);
       session.status = 'error';
       session.error = err instanceof Error ? err.message : String(err);
-      emitChatEvent({ type: 'session.error', deviceId, sessionId, error: session.error });
+      emitChatEvent({ type: 'session.error', deviceId, sessionId, error: session.error, conversationId: session.conversationId });
     }
     throw err;
   }
@@ -350,7 +376,7 @@ async function sendChatMessageUnlocked(gatewayUrl, deviceId, plaintext, _isRetry
     if (_isRetry) {
       throw new Error(`No session for device ${deviceId}`);
     }
-    emitChatEvent({ type: 'session.reconnecting', deviceId });
+    emitChatEvent({ type: 'session.reconnecting', deviceId, conversationId: deviceConversationIds.get(deviceId) || null });
     await startSession(gatewayUrl, deviceId);
     return sendChatMessageUnlocked(gatewayUrl, deviceId, plaintext, true);
   }
@@ -358,7 +384,7 @@ async function sendChatMessageUnlocked(gatewayUrl, deviceId, plaintext, _isRetry
   // If session is in error state (e.g. expired after sleep), auto-reconnect
   if (session.status === 'error' && !_isRetry) {
     endSession(deviceId);
-    emitChatEvent({ type: 'session.reconnecting', deviceId });
+    emitChatEvent({ type: 'session.reconnecting', deviceId, conversationId: session.conversationId });
     await startSession(gatewayUrl, deviceId);
     return sendChatMessageUnlocked(gatewayUrl, deviceId, plaintext, true);
   }
@@ -372,6 +398,7 @@ async function sendChatMessageUnlocked(gatewayUrl, deviceId, plaintext, _isRetry
   // Plaintext must be JSON — agent expects { session_id, message_id, prompt }
   const plaintextJson = JSON.stringify({
     session_id: session.sessionId,
+    conversation_id: session.conversationId,
     message_id: messageId,
     prompt: plaintext,
   });
@@ -388,14 +415,19 @@ async function sendChatMessageUnlocked(gatewayUrl, deviceId, plaintext, _isRetry
 
   try {
     // POST encrypted frame to gateway (match web frontend format)
-    await gateway.sendMessage(gatewayUrl, session.sessionId, {
+    const sendResp = await gateway.sendMessage(gatewayUrl, session.sessionId, {
       type: 'session.message',
       session_id: session.sessionId,
+      conversation_id: session.conversationId,
       message_id: messageId,
       handshake_id: session.handshakeId,
       encrypted: true,
       ...frame,
     });
+    if (typeof sendResp?.conversation_id === 'string' && sendResp.conversation_id.trim()) {
+      session.conversationId = sendResp.conversation_id.trim();
+      deviceConversationIds.set(deviceId, session.conversationId);
+    }
   } catch (err) {
     // Session changed while send was in-flight (disconnect/reconnect/expiry).
     // Do not emit stale events or auto-reconnect from an obsolete session object.
@@ -406,7 +438,7 @@ async function sendChatMessageUnlocked(gatewayUrl, deviceId, plaintext, _isRetry
     // Tear down stale session, reconnect, and retry the message once.
     if (!_isRetry && isHttpStatus(err, 404)) {
       endSession(deviceId);
-      emitChatEvent({ type: 'session.reconnecting', deviceId });
+      emitChatEvent({ type: 'session.reconnecting', deviceId, conversationId: session.conversationId });
       await startSession(gatewayUrl, deviceId);
       return sendChatMessageUnlocked(gatewayUrl, deviceId, plaintext, true);
     }
@@ -422,7 +454,7 @@ async function sendChatMessageUnlocked(gatewayUrl, deviceId, plaintext, _isRetry
   session.nextOutgoingSeq++;
 
   const ts = new Date().toISOString();
-  emitChatEvent({ type: 'message.sent', deviceId, messageId, text: plaintext, ts });
+  emitChatEvent({ type: 'message.sent', deviceId, messageId, text: plaintext, ts, conversationId: session.conversationId });
 
   return { ok: true, messageId };
 }
@@ -452,6 +484,12 @@ function handleSseEvent(deviceId, sseEvent) {
     return; // skip malformed events
   }
 
+  const payloadConversationId = typeof parsed?.conversation_id === 'string' ? parsed.conversation_id.trim() : '';
+  if (payloadConversationId) {
+    session.conversationId = payloadConversationId;
+    deviceConversationIds.set(deviceId, payloadConversationId);
+  }
+
   // Handle different event types
   const eventType = sseEvent.event || parsed.type || parsed.event;
 
@@ -465,7 +503,7 @@ function handleSseEvent(deviceId, sseEvent) {
     if (frame.direction !== 'agent_to_client') {
       const reason = `Unexpected direction: ${frame.direction}`;
       endSession(deviceId, reason);
-      emitChatEvent({ type: 'session.error', deviceId, error: reason });
+      emitChatEvent({ type: 'session.error', deviceId, error: reason, conversationId: session.conversationId });
       return;
     }
 
@@ -475,7 +513,7 @@ function handleSseEvent(deviceId, sseEvent) {
     if (typeof frame.seq !== 'number' || frame.seq !== expectedSeq) {
       const reason = `Unexpected seq: expected ${expectedSeq}, got ${frame.seq}`;
       endSession(deviceId, reason);
-      emitChatEvent({ type: 'session.error', deviceId, error: reason });
+      emitChatEvent({ type: 'session.error', deviceId, error: reason, conversationId: session.conversationId });
       return;
     }
 
@@ -488,20 +526,21 @@ function handleSseEvent(deviceId, sseEvent) {
       // Decryption or payload parse failure — stream is unrecoverable.
       const reason = `Decryption failed: ${err.message}`;
       endSession(deviceId, reason);
-      emitChatEvent({ type: 'session.error', deviceId, error: reason });
+      emitChatEvent({ type: 'session.error', deviceId, error: reason, conversationId: session.conversationId });
       return;
     }
 
     // Route based on the decrypted payload content and SSE event type
     if (decrypted.status === 'running' || eventType === 'session.progress') {
       // Agent is processing — show thinking indicator
-      emitChatEvent({ type: 'message.progress', deviceId, status: 'processing' });
+      emitChatEvent({ type: 'message.progress', deviceId, status: 'processing', conversationId: session.conversationId });
     } else if (decrypted.error || eventType === 'session.error') {
       // Agent-side error
       emitChatEvent({
         type: 'message.error',
         deviceId,
         error: decrypted.error || 'Unknown agent error',
+        conversationId: session.conversationId,
       });
     } else if (decrypted.result !== undefined || eventType === 'session.result') {
       // Agent response — extract the result text
@@ -511,6 +550,7 @@ function handleSseEvent(deviceId, sseEvent) {
         messageId: decrypted.message_id || frame.message_id || null,
         text: decrypted.result || '',
         ts: new Date().toISOString(),
+        conversationId: session.conversationId,
       });
     } else {
       // Unknown encrypted payload — show as message
@@ -521,6 +561,7 @@ function handleSseEvent(deviceId, sseEvent) {
         messageId: decrypted.message_id || frame.message_id || null,
         text,
         ts: new Date().toISOString(),
+        conversationId: session.conversationId,
       });
     }
   } else if (eventType === 'session.ended') {
@@ -530,9 +571,9 @@ function handleSseEvent(deviceId, sseEvent) {
     endSession(deviceId, reason);
     // Keep renderer state reconnectable ("send to reconnect") for terminal
     // gateway session errors instead of showing a plain ended state.
-    emitChatEvent({ type: 'session.error', deviceId, error: reason });
+    emitChatEvent({ type: 'session.error', deviceId, error: reason, conversationId: session.conversationId });
   } else if (eventType === 'processing' || eventType === 'session.processing') {
-    emitChatEvent({ type: 'message.progress', deviceId, status: 'processing' });
+    emitChatEvent({ type: 'message.progress', deviceId, status: 'processing', conversationId: session.conversationId });
   }
 }
 
@@ -551,7 +592,7 @@ function endSession(deviceId, reason) {
   sessions.delete(deviceId);
   sendQueues.delete(deviceId);
 
-  emitChatEvent({ type: 'session.ended', deviceId, reason });
+  emitChatEvent({ type: 'session.ended', deviceId, reason, conversationId: session.conversationId });
 }
 
 /**
@@ -562,6 +603,7 @@ function endAllSessions() {
     endSession(deviceId);
   }
   sendQueues.clear();
+  deviceConversationIds.clear();
 }
 
 /**
@@ -573,6 +615,7 @@ function getSessionStatus(deviceId) {
   return {
     status: session.status,
     sessionId: session.sessionId,
+    conversationId: session.conversationId,
     error: session.error,
   };
 }

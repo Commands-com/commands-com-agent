@@ -47,7 +47,7 @@ function getDevice(deviceId) {
 }
 
 function getChat(deviceId) {
-  return chatState.get(deviceId) || { status: 'idle', messages: [] };
+  return chatState.get(deviceId) || { status: 'idle', messages: [], conversationId: null };
 }
 
 function getDraft(deviceId) {
