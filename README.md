@@ -1,131 +1,127 @@
 # commands-com-agent
 
-Local agent connector for commands.com secure relay.
+Local agent runtime and desktop companion for the Commands secure relay.
 
-This project uses `@anthropic-ai/claude-agent-sdk` locally and includes:
-- browser OAuth/Firebase login flow for device registration (default)
-- manual token init fallback for headless environments
-- local secure config + identity key management
-- gateway identity key registration
-- authenticated handshake ack command
-- always-on websocket runtime with reconnect/backoff
-- encrypted session frame handling (AES-256-GCM)
-- local Claude prompt execution for session tasks
-- optional MCP server passthrough for Claude tool access
+`commands-com-agent` runs an AI agent on your machine, connects it to the gateway, and handles encrypted relay sessions for remote chat. It supports both Claude and Ollama providers.
+
+## Highlights
+
+- Gateway OAuth login and device registration
+- Manual token initialization fallback for non-interactive environments
+- Local identity key management and handshake signing
+- Encrypted session frame handling (AES-256-GCM)
+- Always-on runtime with reconnect/backoff
+- Local prompt execution via `claude` or `ollama`
+- Optional MCP server passthrough for local tool access
+- Electron desktop app for profile setup, logs, and shared-agent chat
 
 ## Requirements
 
 - Node.js 20+
-- Valid local Claude auth for Claude Code / Claude Agent SDK
-- Gateway reachable from your machine
+- Reachable gateway URL
+- Claude provider: local Claude auth for Claude Code / Claude Agent SDK
+- Ollama provider: local Ollama running (default `http://localhost:11434`) with models pulled
 
 ## Install
 
 ```bash
-git clone https://github.com/commands-com/commands-com-agent.git
+git clone https://github.com/Commands-com/commands-com-agent.git
 cd commands-com-agent
 npm install
 npm run build
 ```
 
-## Quickstart (OAuth, recommended)
+## Quickstart (recommended)
 
 ```bash
-# Starts browser OAuth (Firebase), saves config, registers identity key, starts runtime
+# OAuth login + config + identity registration + runtime
 ./start-agent.sh
 
-# Name your device (used to build a stable device_id like dev-office-mac)
+# Optional friendly display name for this device
 INIT_AGENT=1 DEVICE_NAME="office-mac" ./start-agent.sh
 ```
 
-Or run commands directly:
+Notes:
+- If no `--device-id` is supplied, device IDs are generated as `dev_<32 hex>`.
+- `DEVICE_NAME` is a UI label and does not determine device ID format.
+
+### Provider selection
 
 ```bash
-node dist/index.js login \
-  --gateway-url https://api.commands.com \
-  --device-name "office-mac" \
-  --mcp-config ./mcp-servers.json
+# Claude (default)
+PROVIDER=claude MODEL=sonnet ./start-agent.sh
 
-node dist/index.js start --default-cwd $HOME --heartbeat-ms 30000
+# Ollama (local only)
+PROVIDER=ollama MODEL=llama3.2 OLLAMA_BASE_URL=http://localhost:11434 ./start-agent.sh
 ```
 
-## Desktop Wizard (Electron)
+## Desktop app (Electron)
 
-The desktop app provides a local setup wizard for agent profiles, MCP modules, and run/validate controls.
-It can also start/stop the local agent process directly and stream runtime logs.
+The desktop app can:
+- Start/stop local agent processes
+- Stream logs and conversations
+- Sign in with gateway OAuth
+- Show agents shared with you and chat with them
+- Consume share links and manage share grants
 
 ```bash
-# first run (installs desktop deps)
 npm install --prefix ./desktop
 npm run dev:desktop
-
-# subsequent runs
-npm run dev:desktop
 ```
 
-## Headless / Manual fallback
+## CLI usage
 
 ```bash
-# Headless OAuth flow (prints URL, prompts for auth code)
-node dist/index.js login --gateway-url https://api.commands.com --headless
+# OAuth login
+node dist/index.js login --gateway-url https://api.commands.com
 
-# Manual token init (for test/dev or non-interactive bootstrap)
-node dist/index.js init \
-  --gateway-url https://api.commands.com \
-  --device-id <device_id> \
-  --device-token <device_token>
-```
+# Manual init (fallback)
+node dist/index.js init --gateway-url https://api.commands.com --device-id <device_id> --device-token <device_token>
 
-## Commands
-
-```bash
-# Browser OAuth login + device registration
-node dist/index.js login
-
-# Browser OAuth login + custom device name
-node dist/index.js login --device-name "office-mac"
-
-# Headless OAuth login (no auto-open browser)
-node dist/index.js login --headless
-
-# Show local status (add --json for machine-readable output)
+# Status
 node dist/index.js status
 node dist/index.js status --json
 
-# Run one prompt locally through Claude Agent SDK
-node dist/index.js run --prompt "Summarize current TODOs" --cwd /path/to/repo
+# One-off local prompt
+node dist/index.js run --prompt "Summarize current TODOs"
+node dist/index.js run --provider ollama --model llama3.2 --ollama-base-url http://localhost:11434 --prompt "Summarize current TODOs"
 
-# Start always-on runtime
-node dist/index.js start \
-  --default-cwd $HOME \
-  --heartbeat-ms 30000 \
-  --audit-log-path ~/.commands-agent/audit.log \
-  --reconnect-min-ms 1000 \
-  --reconnect-max-ms 30000
+# Start runtime
+node dist/index.js start --default-cwd "$HOME" --heartbeat-ms 30000 --audit-log-path ~/.commands-agent/audit.log
 ```
 
-## Startup script behavior
+See full command options:
 
-`start-agent.sh` defaults to OAuth auth mode and connects to `https://api.commands.com`.
+```bash
+node dist/index.js --help
+```
 
-Environment variables:
+## `start-agent.sh` environment variables
+
+Core variables:
 - `AUTH_MODE=oauth|manual` (default `oauth`)
 - `HEADLESS=1` for headless OAuth login
 - `GATEWAY_URL` (default `https://api.commands.com`)
-- `MODEL`, `DEFAULT_CWD` (default `$HOME`), `HEARTBEAT_MS` (default `30000`)
-- `DEVICE_NAME` optional friendly name for OAuth login (`dev-<device_name_slug>`)
-- `AUDIT_LOG_PATH` local JSONL audit trail path (default `~/.commands-agent/audit.log`)
+- `PROVIDER=claude|ollama` (default `claude`)
+- `MODEL` (default `sonnet`)
+- `OLLAMA_BASE_URL` (default `http://localhost:11434`, ollama only)
+- `DEVICE_NAME` optional friendly display name
+- `DEFAULT_CWD` (default `$HOME`)
+- `HEARTBEAT_MS` (default `30000`)
+- `AUDIT_LOG_PATH` (default `~/.commands-agent/audit.log`)
+
+MCP variables:
 - `MCP_CONFIG` (default `./mcp-servers.local.json`)
 - `MCP_FILESYSTEM_ROOT` (default `$HOME`)
-- `DEVICE_ID`, `DEVICE_TOKEN` (required only in `AUTH_MODE=manual`)
+- `MCP_FILESYSTEM_ENABLED=0|1`
 
-## MCP config file format
+Manual auth variables:
+- `DEVICE_ID`
+- `DEVICE_TOKEN`
 
-`--mcp-config` accepts either:
-- a direct MCP server map, or
-- an object containing `mcpServers`.
+## MCP config format
 
-Example:
+`--mcp-config` accepts either a direct server map or an object with `mcpServers`.
 
 ```json
 {
@@ -143,42 +139,17 @@ Example:
 }
 ```
 
-## Runtime message support
+## Security and project policy
 
-Handled incoming frame types:
-- `heartbeat` / `ping`
-- `session.handshake.request`
-- `session.message` (plaintext or encrypted envelope)
-- `session.cancel`
+- Security notes:
+  - Config stored at `~/.commands-agent/config.json`
+  - File permissions tightened (`0700` dir, `0600` file)
+  - Session keys kept in memory after handshake
+  - Monotonic sequence + deterministic nonce checks
+- Vulnerability reporting: see [`SECURITY.md`](./SECURITY.md)
+- Contribution workflow: see [`CONTRIBUTING.md`](./CONTRIBUTING.md)
+- License: [`MIT`](./LICENSE)
 
-Produced outgoing frame types:
-- `agent.hello`
-- `heartbeat`
-- `session.handshake.ack`
-- `session.progress` (plaintext or encrypted envelope)
-- `session.result` (plaintext or encrypted envelope)
-- `session.error` (plaintext or encrypted envelope)
-- `agent.error`
+## Additional docs
 
-## Encryption behavior
-
-When `session.message` includes encrypted fields (`ciphertext`, `nonce`, `tag`, `seq`), the runtime:
-- validates strict in-order sequence (`seq`)
-- validates deterministic nonce by direction + seq
-- decrypts with `client_to_agent` key (AES-256-GCM)
-- executes prompt locally
-- returns encrypted `session.result` or `session.error` using `agent_to_client` key
-
-## Security notes
-
-- Config is stored at `~/.commands-agent/config.json`.
-- File permissions are tightened (`0700` dir, `0600` file).
-- Identity keys are generated and stored locally.
-- Session keys are derived after handshake and kept in memory.
-- Nonce reuse is prevented via deterministic nonce + monotonic sequence.
-- MCP server permissions are the responsibility of the local operator; only trust servers you control.
-- Incoming session prompts are logged locally to the audit log path for owner review.
-
-## Known gaps
-
-No known exploitable security gaps. All session frames are encrypted and the gateway enforces envelope validation and replay protection by default.
+See `/docs` for current architecture, rebuild specs, and delivery plans.
