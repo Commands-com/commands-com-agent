@@ -1,19 +1,35 @@
-# commands-com-agent
+<div align="center">
 
-Local agent runtime and desktop companion for the Commands secure relay.
+# Commands.com Agent
 
-`commands-com-agent` runs an AI agent on your machine, connects it to the gateway, and handles encrypted relay sessions for remote chat. It supports both Claude and Ollama providers.
+**Run locally. Share securely. Keep your code.**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Node.js](https://img.shields.io/badge/Node.js-20%2B-43853d.svg)](https://nodejs.org/)
+[![Encryption](https://img.shields.io/badge/E2EE-AES--256--GCM-8B5CF6.svg)](#security-and-project-policy)
+[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#install)
+
+Run an AI agent on your machine and share access through an encrypted relay.
+Your code stays local. Messages are end-to-end encrypted. The relay can't read message content.
+
+```
+Your Machine  ◄── E2EE ──►  Commands.com Relay  ◄── E2EE ──►  Remote Browser
+```
+
+</div>
+
+---
 
 ## Highlights
 
-- Gateway OAuth login and device registration
-- Manual token initialization fallback for non-interactive environments
-- Local identity key management and handshake signing
-- Encrypted session frame handling (AES-256-GCM)
-- Always-on runtime with reconnect/backoff
-- Local prompt execution via `claude` or `ollama`
-- Optional MCP server passthrough for local tool access
-- Electron desktop app for profile setup, logs, and shared-agent chat
+| | |
+|---|---|
+| **Encrypted relay** | X25519 ECDH key exchange, AES-256-GCM frame encryption, strict replay protection |
+| **Multi-provider** | Claude (Agent SDK) or Ollama (local LLMs) — switch with an env var |
+| **Desktop app** | Electron companion for profile setup, logs, shared-agent chat, and share management |
+| **Always-on runtime** | WebSocket with reconnect/backoff, heartbeat monitoring, audit logging |
+| **MCP passthrough** | Expose local MCP servers (filesystem, GitHub, custom) to remote sessions |
+| **OAuth + identity keys** | Gateway OAuth login, Ed25519 device identity, signed handshakes |
 
 ## Requirements
 
