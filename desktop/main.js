@@ -1116,6 +1116,10 @@ async function startAgent(payload = {}) {
       if (line.startsWith(EVENT_PREFIX)) {
         try {
           const payload = JSON.parse(line.slice(EVENT_PREFIX.length));
+          // Inject profileId so renderer can attribute events to a specific agent
+          if (!payload.profileId && agentState.launchConfig?.profileId) {
+            payload.profileId = agentState.launchConfig.profileId;
+          }
           emitToAllWindows('desktop:conversation-event', payload);
         } catch (_e) { /* malformed event line — skip */ }
       } else if (line.length > 0) {
@@ -1141,6 +1145,9 @@ async function startAgent(payload = {}) {
       if (stdoutBuffer.startsWith(EVENT_PREFIX)) {
         try {
           const payload = JSON.parse(stdoutBuffer.slice(EVENT_PREFIX.length));
+          if (!payload.profileId && agentState.launchConfig?.profileId) {
+            payload.profileId = agentState.launchConfig.profileId;
+          }
           emitToAllWindows('desktop:conversation-event', payload);
         } catch (_e) { /* skip */ }
       } else {

@@ -7,6 +7,7 @@ import {
   escapeHtml, botIconSvg,
   isProfileRunning,
   authState, sharedAgentsState,
+  getUnseenCount, formatUnseenBadge,
 } from '../state.js';
 
 export function renderSidebar(container) {
@@ -18,6 +19,11 @@ export function renderSidebar(container) {
   const agentCards = profiles.map((p) => {
     const running = isProfileRunning(p.id);
     const active = selectedId === p.id && currentView === 'agent-detail';
+    const unseen = getUnseenCount(p.id);
+    const badgeText = formatUnseenBadge(unseen);
+    const badgeHtml = unseen > 0
+      ? `<span class="unseen-badge" aria-label="${unseen} unseen message${unseen !== 1 ? 's' : ''}">${escapeHtml(badgeText)}</span>`
+      : '';
 
     return `
       <div class="agent-card${active ? ' active' : ''}" data-agent-id="${escapeHtml(p.id)}">
@@ -28,6 +34,7 @@ export function renderSidebar(container) {
           <div class="agent-card-name">${escapeHtml(p.name)}</div>
           <div class="agent-card-meta">${running ? '<span style="color: var(--ok)">Running</span>' : ''}</div>
         </div>
+        ${badgeHtml}
         <div class="status-dot${running ? ' running' : ''}"></div>
       </div>
     `;

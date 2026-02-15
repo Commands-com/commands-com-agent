@@ -228,6 +228,7 @@ export function processConversationEvent(event) {
       if (!conversationState.sessions.has(sid)) {
         conversationState.sessions.set(sid, {
           sessionId: sid,
+          profileId: event.profileId || '',
           startedAt: event.establishedAt || event.ts,
           requesterUid: '',
           requesterEmail: '',
@@ -248,6 +249,7 @@ export function processConversationEvent(event) {
         // Session started before desktop was watching — create it
         session = {
           sessionId: sid,
+          profileId: event.profileId || '',
           startedAt: event.ts,
           requesterUid: event.requesterUid || '',
           requesterEmail: event.requesterEmail || '',
@@ -330,9 +332,12 @@ export function clearConversations() {
   conversationState.selectedSessionId = null;
 }
 
-export function getSessionList() {
-  return Array.from(conversationState.sessions.values())
-    .sort((a, b) => (b.lastActivity || '').localeCompare(a.lastActivity || ''));
+export function getSessionList(profileId) {
+  let sessions = Array.from(conversationState.sessions.values());
+  if (profileId) {
+    sessions = sessions.filter((s) => s.profileId === profileId);
+  }
+  return sessions.sort((a, b) => (b.lastActivity || '').localeCompare(a.lastActivity || ''));
 }
 
 export function getSelectedSession() {
@@ -444,6 +449,82 @@ export function processChatEvent(event) {
 
 export function clearChatState() {
   chatState.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Unseen message badges (Spec 08)
+// ---------------------------------------------------------------------------
+const UNSEEN_DEDUP_CAP = 500;
+
+/** Per-profile unseen incoming message count. */
+export const unseenCounts = new Map(); // Map<profileId, number>
+
+/** Dedup set to avoid double-counting the same event. */
+const unseenSeenKeys = new Set();
+
+/** FIFO queue for evicting oldest dedup keys when cap is reached. */
+const unseenSeenQueue = [];
+
+/**
+ * Record an incoming message event and increment the unseen count for a profile.
+ * Returns true if the count was incremented, false if deduplicated or skipped.
+ */
+export function incrementUnseen(profileId, sessionId, messageId) {
+  if (!profileId || !sessionId || !messageId) return false;
+
+  const key = `${profileId}|${sessionId}|${messageId}`;
+  if (unseenSeenKeys.has(key)) return false;
+
+  // Add to dedup cache with FIFO eviction
+  unseenSeenKeys.add(key);
+  unseenSeenQueue.push(key);
+  while (unseenSeenQueue.length > UNSEEN_DEDUP_CAP) {
+    const evict = unseenSeenQueue.shift();
+    unseenSeenKeys.delete(evict);
+  }
+
+  const current = unseenCounts.get(profileId) || 0;
+  unseenCounts.set(profileId, current + 1);
+  return true;
+}
+
+/**
+ * Reset the unseen count for a profile (e.g., when the user opens that agent view).
+ */
+export function clearUnseenForProfile(profileId) {
+  unseenCounts.delete(profileId);
+}
+
+/**
+ * Clear all unseen state (e.g., on sign-out or full reset).
+ */
+export function clearAllUnseen() {
+  unseenCounts.clear();
+  unseenSeenKeys.clear();
+  unseenSeenQueue.length = 0;
+}
+
+/**
+ * Remove unseen state for a deleted profile.
+ */
+export function removeUnseenProfile(profileId) {
+  unseenCounts.delete(profileId);
+}
+
+/**
+ * Get the unseen count for a profile.
+ */
+export function getUnseenCount(profileId) {
+  return unseenCounts.get(profileId) || 0;
+}
+
+/**
+ * Format unseen count for display: 0 → '', 1-99 → exact, 100+ → '99+'
+ */
+export function formatUnseenBadge(count) {
+  if (!count || count <= 0) return '';
+  if (count >= 100) return '99+';
+  return String(count);
 }
 
 // ---------------------------------------------------------------------------

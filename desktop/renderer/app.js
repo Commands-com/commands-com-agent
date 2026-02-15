@@ -12,6 +12,7 @@ import {
   updateAuthState, authState,
   updateSharedDevices, updateDeviceStatus, sharedAgentsState,
   processChatEvent, clearChatState,
+  incrementUnseen, clearUnseenForProfile, clearAllUnseen,
 } from './state.js';
 import { renderSidebar } from './components/sidebar.js';
 import { renderDashboard } from './views/dashboard.js';
@@ -30,6 +31,10 @@ export function setView(name, agentId) {
   viewState.currentView = name;
   if (agentId !== undefined) {
     viewState.selectedAgentId = agentId;
+  }
+  // Clear unseen badge when user opens that agent's detail view
+  if (name === 'agent-detail' && agentId) {
+    clearUnseenForProfile(agentId);
   }
   renderSidebar(document.getElementById('sidebar'));
   renderMainPanel();
@@ -84,6 +89,7 @@ function clearSharedAgentSessionState() {
   sharedAgentsState.selectedDeviceId = null;
   clearChatState();
   clearAgentChatTransientState();
+  clearAllUnseen();
 }
 
 function subscribeIPC() {
@@ -102,9 +108,10 @@ function subscribeIPC() {
     const wasRunning = runtimeState.status.running;
     updateRuntimeStatus(status);
 
-    // Clear conversations when agent stops
+    // Clear conversations and unseen badges when agent stops
     if (wasRunning && !status.running) {
       clearConversations();
+      clearAllUnseen();
     }
 
     // Re-render sidebar (status dots) and main panel if relevant
@@ -116,6 +123,21 @@ function subscribeIPC() {
 
   unsubConversation = window.commandsDesktop.onConversationEvent((event) => {
     processConversationEvent(event);
+
+    // Unseen badge: increment for incoming messages on non-visible agents
+    if (event?.event === 'session.message') {
+      const profileId = event.profileId || runningProfileId();
+      if (profileId) {
+        const isViewing = viewState.currentView === 'agent-detail' && viewState.selectedAgentId === profileId;
+        if (!isViewing) {
+          const changed = incrementUnseen(profileId, event.sessionId, event.messageId);
+          if (changed) {
+            renderSidebar(document.getElementById('sidebar'));
+          }
+        }
+      }
+    }
+
     // Re-render conversations tab if currently viewing it
     if (
       viewState.currentView === 'agent-detail' &&

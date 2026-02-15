@@ -11,6 +11,7 @@ import {
   auditState, resetAuditState, DEFAULT_AUDIT_LIMIT, MAX_AUDIT_LIMIT, clamp,
   DEFAULT_GATEWAY_URL, authState,
   conversationState, getSessionList, getSelectedSession,
+  removeUnseenProfile,
 } from '../state.js';
 import { renderMarkdownUntrusted } from '../markdown.js';
 
@@ -163,6 +164,7 @@ export async function renderAgentDetail(container, profileId) {
     const result = await window.commandsDesktop.profiles.delete(profileId);
     if (result.ok) {
       invalidateProfileCache(profileId);
+      removeUnseenProfile(profileId);
       await loadProfiles();
       window.__hub.setView('dashboard');
     } else {
@@ -180,7 +182,7 @@ function renderTabContent(container, tab, profile, extra = {}) {
 
   switch (tab) {
     case 'conversations':
-      renderConversationsTab(container);
+      renderConversationsTab(container, profile?.id);
       break;
     case 'logs':
       renderLogsTab(container);
@@ -230,8 +232,8 @@ function requesterIdentityLabel(displayName, email, uid) {
   return shortUid(uid);
 }
 
-function renderConversationsTab(container) {
-  const sessions = getSessionList();
+function renderConversationsTab(container, profileId) {
+  const sessions = getSessionList(profileId);
   const running = runtimeState.status.running;
 
   if (sessions.length === 0) {
@@ -388,7 +390,7 @@ function renderConversationsTab(container) {
     const card = target ? target.closest('[data-session-id]') : null;
     if (!card) return;
     conversationState.selectedSessionId = card.dataset.sessionId;
-    renderConversationsTab(container);
+    renderConversationsTab(container, profileId);
   });
 }
 
