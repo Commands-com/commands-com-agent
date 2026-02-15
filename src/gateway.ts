@@ -66,7 +66,8 @@ export async function registerIdentityKey(
   gatewayUrl: string,
   deviceId: string,
   deviceToken: string,
-  publicKeyRawBase64: string
+  publicKeyRawBase64: string,
+  displayName?: string
 ): Promise<JsonResult<void>> {
   return requestJson<void>(`${gatewayUrl}/gateway/v1/devices/${encodeURIComponent(deviceId)}/identity-key`, {
     method: 'PUT',
@@ -74,6 +75,9 @@ export async function registerIdentityKey(
     body: JSON.stringify({
       algorithm: 'ed25519',
       public_key: publicKeyRawBase64,
+      ...(typeof displayName === 'string' && displayName.trim()
+        ? { display_name: displayName.trim() }
+        : {}),
     }),
   });
 }

@@ -34,6 +34,7 @@ export interface AgentConfig {
   version: 1;
   gatewayUrl: string;
   deviceId: string;
+  deviceName?: string;
   deviceToken: string;
   model: string;
   permissionProfile?: PermissionProfile;

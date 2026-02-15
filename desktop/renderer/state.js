@@ -171,6 +171,7 @@ export function runningProfileId() {
 export const auditState = {
   entries: [],
   requesterUids: [],
+  requesterIdentities: [],
   summary: null,
   auditLogPath: '',
   filters: {
@@ -188,6 +189,7 @@ export const auditState = {
 export function resetAuditState() {
   auditState.entries = [];
   auditState.requesterUids = [];
+  auditState.requesterIdentities = [];
   auditState.summary = null;
   auditState.auditLogPath = '';
   auditState.filters = {
@@ -206,7 +208,7 @@ export function resetAuditState() {
 // Conversation state (live sessions)
 // ---------------------------------------------------------------------------
 export const conversationState = {
-  sessions: new Map(),       // Map<sessionId, { sessionId, startedAt, requesterUid, messages: [], status }>
+  sessions: new Map(),       // Map<sessionId, { sessionId, startedAt, requesterUid, requesterEmail, requesterDisplayName, messages: [], status }>
   selectedSessionId: null,
 };
 
@@ -222,6 +224,8 @@ export function processConversationEvent(event) {
           sessionId: sid,
           startedAt: event.establishedAt || event.ts,
           requesterUid: '',
+          requesterEmail: '',
+          requesterDisplayName: '',
           messages: [],
           status: 'active',
           lastActivity: event.ts,
@@ -240,6 +244,8 @@ export function processConversationEvent(event) {
           sessionId: sid,
           startedAt: event.ts,
           requesterUid: event.requesterUid || '',
+          requesterEmail: event.requesterEmail || '',
+          requesterDisplayName: event.requesterDisplayName || '',
           messages: [],
           status: 'active',
           lastActivity: event.ts,
@@ -248,6 +254,12 @@ export function processConversationEvent(event) {
       }
       if (event.requesterUid) {
         session.requesterUid = event.requesterUid;
+      }
+      if (typeof event.requesterEmail === 'string' && event.requesterEmail.trim()) {
+        session.requesterEmail = event.requesterEmail.trim();
+      }
+      if (typeof event.requesterDisplayName === 'string' && event.requesterDisplayName.trim()) {
+        session.requesterDisplayName = event.requesterDisplayName.trim();
       }
       session.messages.push({
         role: 'user',

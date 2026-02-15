@@ -205,6 +205,20 @@ function truncate(str, len) {
   return str.slice(0, len) + '...';
 }
 
+function shortUid(uid) {
+  const value = typeof uid === 'string' ? uid.trim() : '';
+  if (!value) return '';
+  return value.length > 12 ? value.slice(0, 12) : value;
+}
+
+function requesterIdentityLabel(displayName, email, uid) {
+  const name = typeof displayName === 'string' ? displayName.trim() : '';
+  if (name) return name;
+  const emailValue = typeof email === 'string' ? email.trim() : '';
+  if (emailValue) return emailValue;
+  return shortUid(uid);
+}
+
 function renderConversationsTab(container) {
   const sessions = getSessionList();
   const running = runtimeState.status.running;
@@ -230,14 +244,18 @@ function renderConversationsTab(container) {
     const statusCls = s.status === 'ended' ? 'ended' : 'active';
     const lastMsg = s.messages[s.messages.length - 1];
     const preview = lastMsg ? truncate(lastMsg.text, 60) : '';
-    const requester = s.requesterUid ? truncate(s.requesterUid, 20) : 'Unknown';
+    const requesterLabel = requesterIdentityLabel(s.requesterDisplayName, s.requesterEmail, s.requesterUid) || 'Unknown';
+    const requesterUid = typeof s.requesterUid === 'string' ? s.requesterUid.trim() : '';
+    const requesterSecondary = requesterUid && requesterUid !== requesterLabel
+      ? ` (${truncate(requesterUid, 20)})`
+      : '';
     // Check if the last user message has no response yet
     const isProcessing = lastMsg?.role === 'user';
 
     return `
-      <div class="session-card ${active ? 'selected' : ''}" data-session-id="${escapeHtml(s.sessionId)}">
+        <div class="session-card ${active ? 'selected' : ''}" data-session-id="${escapeHtml(s.sessionId)}">
         <div class="session-card-head">
-          <span class="session-requester">${escapeHtml(requester)}</span>
+          <span class="session-requester">${escapeHtml(requesterLabel + requesterSecondary)}</span>
           <span class="session-status ${statusCls}"></span>
         </div>
         <div class="session-card-time">${formatTime(s.startedAt)}</div>
@@ -296,10 +314,19 @@ function renderConversationsTab(container) {
     const processingHtml = lastMsg?.role === 'user'
       ? '<div class="message-processing"><span class="processing-dots"></span> Agent is thinking...</div>'
       : '';
+    const selectedRequesterLabel = requesterIdentityLabel(
+      selected.requesterDisplayName,
+      selected.requesterEmail,
+      selected.requesterUid
+    ) || 'Unknown';
+    const selectedRequesterUid = typeof selected.requesterUid === 'string' ? selected.requesterUid.trim() : '';
+    const selectedRequesterSecondary = selectedRequesterUid && selectedRequesterUid !== selectedRequesterLabel
+      ? ` (${truncate(selectedRequesterUid, 20)})`
+      : '';
 
     threadHtml = `
       <div class="thread-header">
-        <span class="thread-requester">${escapeHtml(selected.requesterUid || 'Unknown')}</span>
+        <span class="thread-requester">${escapeHtml(selectedRequesterLabel + selectedRequesterSecondary)}</span>
         <span class="thread-session-id">${escapeHtml(truncate(selected.sessionId, 16))}</span>
       </div>
       <div class="thread-messages" id="thread-messages">
@@ -437,6 +464,7 @@ async function loadAuditEntries(container, profile) {
 
   auditState.entries = result.entries || [];
   auditState.requesterUids = result.requester_uids || [];
+  auditState.requesterIdentities = result.requester_identities || [];
   auditState.summary = result.summary || null;
   auditState.auditLogPath = result.auditLogPath || '';
 
@@ -444,11 +472,18 @@ async function loadAuditEntries(container, profile) {
 }
 
 function renderAuditContent(container, profile) {
-  const { entries, summary, auditLogPath, filters, messagesOnly, requesterUids } = auditState;
-
-  const requesterOpts = requesterUids.map((uid) =>
-    `<option value="${escapeHtml(uid)}"${uid === filters.requester ? ' selected' : ''}>${escapeHtml(uid)}</option>`
-  ).join('');
+  const { entries, summary, auditLogPath, filters, messagesOnly, requesterUids, requesterIdentities } = auditState;
+  const identityOptions = Array.isArray(requesterIdentities) && requesterIdentities.length > 0
+    ? requesterIdentities
+    : requesterUids.map((uid) => ({ key: uid, label: uid }));
+  const requesterOpts = identityOptions
+    .map((identity) => {
+      const key = typeof identity?.key === 'string' ? identity.key : '';
+      const label = typeof identity?.label === 'string' ? identity.label : key;
+      if (!key) return '';
+      return `<option value="${escapeHtml(key)}"${key === filters.requester ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+    })
+    .join('');
 
   const summaryText = summary
     ? `${summary.matches} matches / ${summary.parsedEntries} entries (${summary.returned} shown)`
@@ -567,7 +602,10 @@ function renderAuditEntries(entries, messagesOnly) {
   return entries.map((entry, idx) => {
     const event = entry.event || 'unknown';
     const timestamp = entry.at || entry.received_at || '';
-    const requester = entry.requester_uid || '';
+    const requesterUid = entry.requester_uid || entry.requester?.uid || '';
+    const requesterEmail = entry.requester_email || entry.requester?.email || '';
+    const requesterDisplayName = entry.requester_display_name || entry.requester?.display_name || entry.requester?.name || '';
+    const requesterLabel = requesterIdentityLabel(requesterDisplayName, requesterEmail, requesterUid);
     const sessionId = entry.session_id || '';
 
     if (messagesOnly) {
@@ -588,6 +626,20 @@ function renderAuditEntries(entries, messagesOnly) {
       `;
     }
 
+    const requesterMetaParts = [];
+    if (requesterLabel) {
+      requesterMetaParts.push(`Requester: <code>${escapeHtml(requesterLabel)}</code>`);
+    }
+    if (requesterEmail && requesterEmail !== requesterLabel) {
+      requesterMetaParts.push(`Email: <code>${escapeHtml(requesterEmail)}</code>`);
+    }
+    if (requesterUid && requesterUid !== requesterLabel) {
+      requesterMetaParts.push(`UID: <code>${escapeHtml(requesterUid)}</code>`);
+    }
+    if (sessionId) {
+      requesterMetaParts.push(`Session: <code>${escapeHtml(sessionId)}</code>`);
+    }
+
     // Full view
     return `
       <div class="audit-entry" data-idx="${idx}">
@@ -595,10 +647,7 @@ function renderAuditEntries(entries, messagesOnly) {
           <span class="audit-event">${escapeHtml(event)}</span>
           <span class="audit-time">${escapeHtml(timestamp)}</span>
         </div>
-        <div class="audit-meta">
-          ${requester ? `Requester: <code>${escapeHtml(requester)}</code>` : ''}
-          ${sessionId ? ` &middot; Session: <code>${escapeHtml(sessionId)}</code>` : ''}
-        </div>
+        <div class="audit-meta">${requesterMetaParts.join(' &middot; ')}</div>
         ${entry.prompt ? `<div class="audit-prompt">${escapeHtml(entry.prompt)}</div>` : ''}
         <div class="audit-entry-actions row">
           ${entry.prompt ? `<button class="copy-prompt-btn" data-idx="${idx}" style="font-size: 11px;">Copy Prompt</button>` : ''}

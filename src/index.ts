@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import crypto from 'node:crypto';
-import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import {
@@ -82,18 +81,6 @@ function parseIntStrict(value: string, fieldName: string): number {
   return Math.floor(parsed);
 }
 
-function sanitizeDeviceSegment(value: string, maxLength: number): string {
-  const normalized = value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .replace(/-+/g, '-');
-  if (!normalized) {
-    return '';
-  }
-  return normalized.slice(0, maxLength).replace(/-+$/g, '');
-}
-
 function isInvalidJWTError(message: string): boolean {
   const normalized = message.toLowerCase();
   return normalized.includes('invalid jwt token') || normalized.includes('failed to parse token');
@@ -134,24 +121,8 @@ async function resolveMcpServers(
   return loadMcpServersFromFile(mcpConfigPath);
 }
 
-function generatedDeviceID(userID?: string, deviceName?: string): string {
-  if (deviceName) {
-    const namedPart = sanitizeDeviceSegment(deviceName, 32);
-    if (!namedPart) {
-      throw new Error('device name must include letters or numbers');
-    }
-    return namedPart;
-  }
-
-  const hostPart = sanitizeDeviceSegment(os.hostname(), 18);
-  const userPart = sanitizeDeviceSegment(userID ?? 'user', 12) || 'user';
-
-  if (hostPart) {
-    return `${hostPart}-${userPart}`;
-  }
-
-  const suffix = crypto.randomBytes(4).toString('hex');
-  return `${userPart}-${suffix}`;
+function generatedDeviceID(): string {
+  return `dev_${crypto.randomBytes(16).toString('hex')}`;
 }
 
 function createRuntimePolicy(permissionProfile: PermissionProfile, allowedRoot: string): AgentConfig['policy'] {
@@ -216,10 +187,6 @@ async function cmdLogin(flags: Map<string, string>): Promise<void> {
 
   const requestedDeviceID = flags.get('device-id')?.trim();
   const requestedDeviceName = flags.get('device-name')?.trim();
-  if (requestedDeviceID && requestedDeviceName) {
-    throw new Error('use either --device-id or --device-name, not both');
-  }
-  const namedDeviceID = requestedDeviceName ? generatedDeviceID(oauth.userID, requestedDeviceName) : '';
   const existing = await loadConfig();
   const defaultPermissionProfile = resolvePermissionProfile(existing?.permissionProfile, 'dev-safe');
   const permissionProfile = resolvePermissionProfile(flags.get('permission-profile')?.trim(), defaultPermissionProfile);
@@ -229,8 +196,9 @@ async function cmdLogin(flags: Map<string, string>): Promise<void> {
     !!existing.deviceId &&
     (!oauth.userID || !existing.ownerUID || existing.ownerUID === oauth.userID);
 
-  const reusingExistingDevice = !requestedDeviceID && !namedDeviceID && canReuseExisting;
-  const deviceId = requestedDeviceID || namedDeviceID || (reusingExistingDevice ? existing.deviceId : generatedDeviceID(oauth.userID));
+  const reusingExistingDevice = !requestedDeviceID && canReuseExisting;
+  const deviceId = requestedDeviceID || (reusingExistingDevice ? existing.deviceId : generatedDeviceID());
+  const deviceName = requestedDeviceName || (reusingExistingDevice ? existing?.deviceName || '' : '');
   const identity = reusingExistingDevice ? existing.identity : generateIdentity();
 
   const expiresAt = new Date(Date.now() + oauth.expiresIn * 1000).toISOString();
@@ -239,6 +207,7 @@ async function cmdLogin(flags: Map<string, string>): Promise<void> {
     version: 1,
     gatewayUrl,
     deviceId,
+    ...(deviceName ? { deviceName } : {}),
     deviceToken: oauth.accessToken,
     model,
     permissionProfile,
@@ -255,8 +224,8 @@ async function cmdLogin(flags: Map<string, string>): Promise<void> {
   console.log(`Saved config: ${CONFIG_PATH}`);
   if (reusingExistingDevice) {
     console.log(`[auth] reusing existing device id: ${deviceId}`);
-  } else if (namedDeviceID) {
-    console.log(`[auth] using named device id: ${deviceId}`);
+  } else {
+    console.log(`[auth] generated device id: ${deviceId}`);
   }
 
   if (mcpServers) {
@@ -267,7 +236,8 @@ async function cmdLogin(flags: Map<string, string>): Promise<void> {
     config.gatewayUrl,
     config.deviceId,
     config.deviceToken,
-    config.identity.publicKeyRawBase64
+    config.identity.publicKeyRawBase64,
+    config.deviceName
   );
 
   if (!reg.ok) {
@@ -313,7 +283,8 @@ async function cmdInit(flags: Map<string, string>): Promise<void> {
     config.gatewayUrl,
     config.deviceId,
     config.deviceToken,
-    config.identity.publicKeyRawBase64
+    config.identity.publicKeyRawBase64,
+    config.deviceName
   );
 
   if (!reg.ok) {
@@ -480,7 +451,8 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
     effectiveConfig.gatewayUrl,
     effectiveConfig.deviceId,
     effectiveConfig.deviceToken,
-    effectiveConfig.identity.publicKeyRawBase64
+    effectiveConfig.identity.publicKeyRawBase64,
+    effectiveConfig.deviceName
   );
 
   if (!preflight.ok) {
@@ -557,7 +529,8 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
         effectiveConfig.gatewayUrl,
         effectiveConfig.deviceId,
         effectiveConfig.deviceToken,
-        effectiveConfig.identity.publicKeyRawBase64
+        effectiveConfig.identity.publicKeyRawBase64,
+        effectiveConfig.deviceName
       );
       if (!retry.ok) {
         throw new Error(`identity registration failed after auth recovery: ${retry.error}`);

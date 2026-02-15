@@ -1,6 +1,6 @@
 # Spec 02 - Requester Email and Identity Enrichment
 
-Status: Draft
+Status: Implemented (2026-02-15)
 Priority: P1
 
 ## Problem
@@ -66,6 +66,12 @@ Fallback rules:
 - Relay envelope builder: include enriched requester fields server-side.
 - Audit log schema: optional `requester_email`, `requester_display_name`.
 - Keep backward compatibility for consumers expecting only `requester_uid`.
+
+Implemented:
+- Gateway relay now force-overwrites `requester_uid`, `requester_email`, `requester_display_name`, and normalized `requester` object on ingress before forwarding to agent.
+- Agent runtime now records requester email/display in audit events and emits enriched desktop live-conversation events.
+- Desktop Live Conversations now render `display_name || email || short(uid)` with UID as secondary context.
+- Desktop Audit UI now supports requester filtering by UID/email/display and renders enriched requester identity metadata.
 
 ## Verification
 

@@ -17,6 +17,7 @@ const DESKTOP_SETTINGS_PATH = path.join(os.homedir(), '.commands-agent', 'deskto
 const VALID_MODELS = ['opus', 'sonnet', 'haiku'];
 const VALID_PERMISSIONS = ['read-only', 'dev-safe', 'full'];
 const PROFILE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+const PROFILE_DEVICE_ID_RE = /^dev_[a-f0-9]{32}$/;
 const TRUSTED_AGENT_PACKAGE_NAMES = new Set(['commands-com-agent']);
 const AVATAR_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
 const AVATAR_MAGIC = {
@@ -592,6 +593,8 @@ function buildAgentEnv(launchProfile, runtimeOptions, agentRoot) {
   delete env.MCP_CONFIG;
   delete env.MCP_FILESYSTEM_ENABLED;
   delete env.MCP_FILESYSTEM_ROOT;
+  delete env.DEVICE_ID;
+  delete env.DEVICE_NAME;
 
   const profileGatewayUrl = typeof launchProfile?.gatewayUrl === 'string' ? launchProfile.gatewayUrl.trim() : '';
   if (profileGatewayUrl) {
@@ -600,7 +603,14 @@ function buildAgentEnv(launchProfile, runtimeOptions, agentRoot) {
     env.GATEWAY_URL = DEFAULT_GATEWAY_URL;
   }
 
+  const normalizedDeviceId = normalizeProfileDeviceId(launchProfile?.deviceId);
+  if (normalizedDeviceId) {
+    env.DEVICE_ID = normalizedDeviceId;
+  }
+
   const normalizedDeviceName = sanitizeDeviceName(launchProfile?.deviceName);
+  // Device name is display metadata only; stable routing identity comes from
+  // DEVICE_ID (profile-scoped immutable value).
   if (normalizedDeviceName) {
     env.DEVICE_NAME = normalizedDeviceName;
   }
@@ -716,21 +726,17 @@ async function startAgent(payload = {}) {
     };
   }
 
-  // Sync device name into agent config.json if it changed.
-  // The DEVICE_NAME env var is only used during login/init, but if the config
-  // already exists, init is skipped and the old deviceId persists. This ensures
-  // a profile rename is picked up without requiring a full re-auth.
-  const desiredDeviceName = typeof launchProfile?.deviceName === 'string' ? launchProfile.deviceName.trim() : '';
-  if (desiredDeviceName) {
+  // Keep runtime config deviceId aligned with immutable profile deviceId.
+  // Display-name changes must not mutate transport identity.
+  const desiredDeviceId = normalizeProfileDeviceId(launchProfile?.deviceId);
+  if (desiredDeviceId) {
     try {
       const agentConfigPath = path.join(os.homedir(), '.commands-agent', 'config.json');
       const raw = await fs.readFile(agentConfigPath, 'utf8');
       const agentConfig = JSON.parse(raw);
-      // Sanitize to match the agent SDK's sanitizeDeviceSegment logic
-      const desiredId = sanitizeDeviceName(desiredDeviceName);
-      if (desiredId && agentConfig.deviceId && agentConfig.deviceId !== desiredId) {
-        emitAgentLog('system', `[desktop] updating deviceId: ${agentConfig.deviceId} → ${desiredId}`);
-        agentConfig.deviceId = desiredId;
+      if (agentConfig.deviceId !== desiredDeviceId) {
+        emitAgentLog('system', `[desktop] updating deviceId: ${agentConfig.deviceId} → ${desiredDeviceId}`);
+        agentConfig.deviceId = desiredDeviceId;
         const tmp = agentConfigPath + '.tmp.' + Date.now() + '.' + randomBytes(4).toString('hex');
         await fs.writeFile(tmp, JSON.stringify(agentConfig, null, 2) + '\n', 'utf8');
         await fs.rename(tmp, agentConfigPath);
@@ -807,6 +813,7 @@ async function startAgent(payload = {}) {
     agentRoot,
     profileId: launchProfile?.id || null,
     gatewayUrl: env.GATEWAY_URL || null,
+    deviceId: env.DEVICE_ID || null,
     deviceName: env.DEVICE_NAME || null,
     defaultCwd: env.DEFAULT_CWD || null,
     model: env.MODEL || null,
@@ -1110,6 +1117,7 @@ ipcMain.handle('desktop:audit:read', async (_event, payload) => {
         auditLogPath,
         entries: [],
         requester_uids: [],
+        requester_identities: [],
         summary: {
           totalLines: 0,
           parsedEntries: 0,
@@ -1151,6 +1159,44 @@ ipcMain.handle('desktop:audit:read', async (_event, payload) => {
       .filter((uid) => uid.length > 0)
   )).sort((a, b) => a.localeCompare(b));
 
+  const requesterIdentityByKey = new Map();
+  parsedEntries.forEach((entry) => {
+    const asRecord = entry;
+    const requesterObj = asRecord && typeof asRecord.requester === 'object' && asRecord.requester !== null
+      ? asRecord.requester
+      : {};
+    const uid = typeof asRecord.requester_uid === 'string'
+      ? asRecord.requester_uid.trim()
+      : (typeof requesterObj.uid === 'string' ? requesterObj.uid.trim() : '');
+    const email = typeof asRecord.requester_email === 'string'
+      ? asRecord.requester_email.trim()
+      : (typeof requesterObj.email === 'string' ? requesterObj.email.trim() : '');
+    const displayName = typeof asRecord.requester_display_name === 'string'
+      ? asRecord.requester_display_name.trim()
+      : (typeof requesterObj.display_name === 'string' ? requesterObj.display_name.trim() : '');
+
+    const key = uid || email || displayName;
+    if (!key) return;
+
+    const baseLabel = displayName || email || uid;
+    const label = uid && baseLabel && uid !== baseLabel
+      ? `${baseLabel} (${uid.slice(0, 12)})`
+      : (baseLabel || key);
+
+    if (!requesterIdentityByKey.has(key)) {
+      requesterIdentityByKey.set(key, {
+        key,
+        uid: uid || null,
+        email: email || null,
+        display_name: displayName || null,
+        label,
+      });
+    }
+  });
+
+  const requesterIdentities = Array.from(requesterIdentityByKey.values())
+    .sort((a, b) => a.label.localeCompare(b.label));
+
   const matches = parsedEntries.filter((entry) => {
     const asRecord = entry;
     const rawSearchText = JSON.stringify(asRecord).toLowerCase();
@@ -1162,7 +1208,20 @@ ipcMain.handle('desktop:audit:read', async (_event, payload) => {
     if (requester) {
       const requesterUid =
         (typeof asRecord.requester_uid === 'string' && asRecord.requester_uid.toLowerCase()) || '';
-      if (!requesterUid.includes(requester)) {
+      const requesterObj = asRecord && typeof asRecord.requester === 'object' && asRecord.requester !== null
+        ? asRecord.requester
+        : {};
+      const requesterEmail =
+        (typeof asRecord.requester_email === 'string' && asRecord.requester_email.toLowerCase()) ||
+        (typeof requesterObj.email === 'string' && requesterObj.email.toLowerCase()) || '';
+      const requesterDisplayName =
+        (typeof asRecord.requester_display_name === 'string' && asRecord.requester_display_name.toLowerCase()) ||
+        (typeof requesterObj.display_name === 'string' && requesterObj.display_name.toLowerCase()) || '';
+      if (
+        !requesterUid.includes(requester) &&
+        !requesterEmail.includes(requester) &&
+        !requesterDisplayName.includes(requester)
+      ) {
         return false;
       }
     }
@@ -1213,6 +1272,7 @@ ipcMain.handle('desktop:audit:read', async (_event, payload) => {
     auditLogPath,
     entries,
     requester_uids: requesterUIDs,
+    requester_identities: requesterIdentities,
     summary: {
       totalLines: lines.length,
       parsedEntries: parsedEntries.length,
@@ -1258,6 +1318,21 @@ function sanitizeDeviceName(value) {
     .replace(/-+/g, '-')
     .slice(0, 32)
     .replace(/-+$/g, '');
+}
+
+function normalizeProfileDeviceId(value) {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  const candidate = value.trim().toLowerCase();
+  if (!PROFILE_DEVICE_ID_RE.test(candidate)) {
+    return '';
+  }
+  return candidate;
+}
+
+function generateProfileDeviceId() {
+  return `dev_${randomBytes(16).toString('hex')}`;
 }
 
 function applyDeviceSuffix(base, suffix) {
@@ -1325,6 +1400,9 @@ function migrateProfile(profile) {
     profile.auditLogPath = profile.auditLogPath || '';
     profile.deviceNameManuallySet = profile.deviceNameManuallySet || false;
   }
+  if (!normalizeProfileDeviceId(profile.deviceId)) {
+    profile.deviceId = generateProfileDeviceId();
+  }
   return profile;
 }
 
@@ -1346,7 +1424,13 @@ async function readProfileById(id) {
   const profilePath = path.join(PROFILES_DIR, id, 'profile.json');
   try {
     const raw = await fs.readFile(profilePath, 'utf8');
-    return migrateProfile(JSON.parse(raw));
+    const parsed = JSON.parse(raw);
+    const hadDeviceId = normalizeProfileDeviceId(parsed.deviceId);
+    const profile = migrateProfile(parsed);
+    if (!hadDeviceId && normalizeProfileDeviceId(profile.deviceId)) {
+      await atomicWrite(profilePath, JSON.stringify(profile, null, 2));
+    }
+    return profile;
   } catch (err) {
     if (err && err.code === 'ENOENT') {
       return null;
@@ -1505,19 +1589,10 @@ ipcMain.handle('desktop:profiles:get', async (_event, payload) => {
     if (!validateProfileId(id)) {
       return { ok: false, error: 'Invalid profile id' };
     }
-
-    const profilePath = path.join(PROFILES_DIR, id, 'profile.json');
-    let raw;
-    try {
-      raw = await fs.readFile(profilePath, 'utf8');
-    } catch (err) {
-      if (err && err.code === 'ENOENT') {
-        return { ok: false, error: 'Profile not found' };
-      }
-      throw err;
+    const profile = await readProfileById(id);
+    if (!profile) {
+      return { ok: false, error: 'Profile not found' };
     }
-
-    const profile = migrateProfile(JSON.parse(raw));
 
     // Check for avatar
     const avatarPath = path.join(PROFILES_DIR, id, 'avatar.png');
@@ -1572,6 +1647,7 @@ ipcMain.handle('desktop:profiles:save', async (_event, payload) => {
       profile = {
         version: 1,
         id,
+        deviceId: generateProfileDeviceId(),
         name: sanitized.name.trim(),
         deviceName,
         deviceNameManuallySet: sanitized.deviceNameManuallySet || false,
@@ -1634,6 +1710,7 @@ ipcMain.handle('desktop:profiles:save', async (_event, payload) => {
         ...existing,
         ...sanitized,
         id: existing.id,  // immutable
+        deviceId: normalizeProfileDeviceId(existing.deviceId) || generateProfileDeviceId(),
         createdAt: existing.createdAt,  // server-controlled
         updatedAt: Date.now(),  // server-controlled
         version: existing.version,
@@ -1680,13 +1757,13 @@ ipcMain.handle('desktop:profiles:delete', async (_event, payload) => {
 
     // Deregister device from gateway (best-effort — don't block local delete)
     const profile = await readProfileById(id);
-    const deviceName = profile?.deviceName;
-    if (deviceName && auth.isSignedIn()) {
+    const deviceId = normalizeProfileDeviceId(profile?.deviceId) || sanitizeDeviceName(profile?.deviceName);
+    if (deviceId && auth.isSignedIn()) {
       try {
         const gatewayUrl = getGatewayUrl();
-        await gatewayClient.deleteDevice(gatewayUrl, deviceName);
+        await gatewayClient.deleteDevice(gatewayUrl, deviceId);
       } catch (err) {
-        console.log(`[profiles] gateway device deregister failed for ${deviceName}: ${err.message || err}`);
+        console.log(`[profiles] gateway device deregister failed for ${deviceId}: ${err.message || err}`);
       }
     }
 
@@ -1807,6 +1884,7 @@ ipcMain.handle('desktop:profiles:migrate', async (_event, payload) => {
     const profile = {
       version: 1,
       id,
+      deviceId: generateProfileDeviceId(),
       name,
       deviceName: sanitizeDeviceName(name) || 'agent',
       deviceNameManuallySet: false,

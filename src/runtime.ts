@@ -45,6 +45,20 @@ function firstString(...values: unknown[]): string | null {
   return null;
 }
 
+function fallbackRequesterDisplayName(email: string | null, uid: string): string {
+  if (email) {
+    const at = email.indexOf('@');
+    if (at > 0) {
+      return email.slice(0, at);
+    }
+    return email;
+  }
+  if (!uid || uid === 'unknown') {
+    return 'unknown';
+  }
+  return uid.length > 12 ? uid.slice(0, 12) : uid;
+}
+
 function parsePositiveSeq(raw: unknown): number | null {
   if (typeof raw === 'number') {
     if (Number.isInteger(raw) && raw > 0) {
@@ -178,7 +192,8 @@ class AgentRuntime {
       this.config.gatewayUrl,
       this.config.deviceId,
       this.config.deviceToken,
-      this.config.identity.publicKeyRawBase64
+      this.config.identity.publicKeyRawBase64,
+      this.config.deviceName
     );
 
     if (!identityReg.ok) {
@@ -372,7 +387,8 @@ class AgentRuntime {
         this.config.gatewayUrl,
         this.config.deviceId,
         this.config.deviceToken,
-        this.config.identity.publicKeyRawBase64
+        this.config.identity.publicKeyRawBase64,
+        this.config.deviceName
       );
       if (!identityReg.ok) {
         throw new Error(`identity registration failed before handshake ack: ${identityReg.error}`);
@@ -519,7 +535,26 @@ class AgentRuntime {
     let prompt: string | null;
     let cwd: string;
     let conversationId = firstString(frame.conversation_id, frame.conversationId) ?? session.conversationId;
-    const requesterUID = firstString(frame.requester_uid, frame.requesterUid, frame.user_id, frame.userId) ?? 'unknown';
+    const requester = isRecord(frame.requester) ? frame.requester : null;
+    const requesterUID = firstString(
+      frame.requester_uid,
+      frame.requesterUid,
+      frame.user_id,
+      frame.userId,
+      requester?.uid
+    ) ?? 'unknown';
+    const requesterEmail = firstString(
+      frame.requester_email,
+      frame.requesterEmail,
+      requester?.email
+    );
+    const requesterDisplayName = firstString(
+      frame.requester_display_name,
+      frame.requesterDisplayName,
+      requester?.display_name,
+      requester?.displayName,
+      requester?.name
+    ) ?? fallbackRequesterDisplayName(requesterEmail, requesterUID);
     const receivedAt = firstString(frame.received_at, frame.receivedAt) ?? new Date().toISOString();
 
     if (hasEncryptedFields) {
@@ -685,6 +720,13 @@ class AgentRuntime {
         event: 'session.message.received',
         received_at: receivedAt,
         requester_uid: requesterUID,
+        requester_email: requesterEmail ?? null,
+        requester_display_name: requesterDisplayName,
+        requester: {
+          uid: requesterUID,
+          email: requesterEmail ?? null,
+          display_name: requesterDisplayName,
+        },
         device_id: this.config.deviceId,
         session_id: sessionId,
         handshake_id: session.handshakeId,
@@ -703,6 +745,8 @@ class AgentRuntime {
       conversationId,
       messageId,
       requesterUid: requesterUID,
+      requesterEmail: requesterEmail ?? null,
+      requesterDisplayName,
       prompt,
     });
 

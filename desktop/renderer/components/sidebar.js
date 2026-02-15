@@ -41,12 +41,14 @@ export function renderSidebar(container) {
       const deviceCards = devices.map((d) => {
         const online = d.status === 'online';
         const active = currentView === 'agent-chat' && selectedId === d.device_id;
-        const name = d.name || d.device_id;
+        const name = d.display_name || d.name || d.device_id;
+        const owner = d.owner_email ? `Owner: ${d.owner_email}` : '';
         return `
           <div class="shared-agent-card${active ? ' active' : ''}" data-device-id="${escapeHtml(d.device_id)}">
             <div class="shared-agent-avatar">${botIconSvg(24, name)}</div>
             <div class="shared-agent-card-info">
               <div class="shared-agent-card-name">${escapeHtml(name)}</div>
+              ${owner ? `<div class="shared-agent-card-meta">${escapeHtml(owner)}</div>` : ''}
               <div class="shared-agent-card-meta">${online ? '<span style="color: var(--ok)">Online</span>' : 'Offline'}</div>
             </div>
             <div class="status-dot${online ? ' running' : ''}"></div>
