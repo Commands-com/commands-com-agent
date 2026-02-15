@@ -1,8 +1,8 @@
-# Commands.com Agent Rebuild - Feature Specs Index
+# Commands.com Agent Feature Specs Index
 
 Date: 2026-02-14
 Owner: Desktop + Gateway
-Status: Draft for implementation
+Status: Active
 
 ## Scope
 
@@ -16,43 +16,39 @@ This spec set covers seven rebuild features:
 6. Ollama model-provider support for local/shared agent runtimes.
 7. OSS gateway fast deploy (Railway-first) for rapid external validation.
 
-Primary vision context: `/Users/dtannen/Code/commands-com-agent/docs/rebuild/VISION.md`.
+Primary vision context: `/Users/dtannen/Code/commands-com-agent/docs/VISION.md`.
 
-## Spec Files
+## Completed
 
-- `/Users/dtannen/Code/commands-com-agent/docs/rebuild/spec-01-agent-name-namespacing.md`
-- `/Users/dtannen/Code/commands-com-agent/docs/rebuild/spec-02-requester-email-identity.md`
-- `/Users/dtannen/Code/commands-com-agent/docs/rebuild/spec-03-multi-agent-runtime.md`
-- `/Users/dtannen/Code/commands-com-agent/docs/rebuild/spec-04-share-links-desktop.md`
-- `/Users/dtannen/Code/commands-com-agent/docs/rebuild/spec-05-agent-to-agent-shared.md`
-- `/Users/dtannen/Code/commands-com-agent/docs/rebuild/spec-06-ollama-support.md`
-- `/Users/dtannen/Code/commands-com-agent/docs/rebuild/spec-07-oss-gateway-fast-deploy.md`
+- `/Users/dtannen/Code/commands-com-agent/docs/complete/spec-01-agent-name-namespacing.md`
+- `/Users/dtannen/Code/commands-com-agent/docs/complete/spec-02-requester-email-identity.md`
+- `/Users/dtannen/Code/commands-com-agent/docs/complete/spec-04-share-links-desktop.md`
+- `/Users/dtannen/Code/commands-com-agent/docs/complete/spec-06-ollama-support.md`
+- `/Users/dtannen/Code/commands-com-agent/docs/complete/spec-08-agent-activity-indicator.md`
 
-## Backlog Specs (Optional / v1.x)
+## Todo
 
-- `/Users/dtannen/Code/commands-com-agent/docs/rebuild/spec-08-agent-activity-indicator.md`
-- `/Users/dtannen/Code/commands-com-agent/docs/rebuild/spec-09-v2-future-mixed-agent-rooms.md`
+- `/Users/dtannen/Code/commands-com-agent/docs/todo/spec-03-multi-agent-runtime.md`
+- `/Users/dtannen/Code/commands-com-agent/docs/todo/spec-05-agent-to-agent-shared.md`
+- `/Users/dtannen/Code/commands-com-agent/docs/todo/spec-07-oss-gateway-fast-deploy.md`
+
+## Future
+
+- `/Users/dtannen/Code/commands-com-agent/docs/future/spec-09-v2-future-mixed-agent-rooms.md`
 
 ## Dependency Order
 
 Recommended implementation order:
 
-1. `spec-01` Namespacing
-2. `spec-02` Requester identity enrichment
-3. `spec-03` Multi-agent runtime
-4. `spec-04` Share links in desktop UI
-5. `spec-05` Agent-to-agent communication (depends on 2, 3, and 4)
-6. `spec-06` Ollama support
-7. `spec-07` OSS gateway fast deploy (depends on endpoint parity from 1-6)
+1. `spec-03` Multi-agent runtime
+2. `spec-05` Agent-to-agent communication (depends on 2, 3, and 4)
+3. `spec-07` OSS gateway fast deploy (depends on endpoint parity from 1-6)
 
 ## Release Strategy
 
-- Phase A: 1, 2, and 3 (runtime and identity foundations)
-- Phase B: 4 (sharing UX and deep links)
-- Phase C: 5 (agent-to-agent bridge + policy controls)
-- Phase D: 6 (Ollama provider parity and UX hardening)
-- Post-v1 Platform: 7 (OSS gateway fast deploy)
-- v1.x UX: 8 (agent activity indicator badge)
+- Completed: 1, 2, 4, 6, 8
+- Current v1 push: 3, 5, 7
+- Future platform exploration: 9
 
 ## Global Security Requirements
 
