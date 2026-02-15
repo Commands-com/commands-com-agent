@@ -7,6 +7,7 @@ import type {
 export type AgentMcpServerConfig = McpStdioServerConfig | McpSSEServerConfig | McpHttpServerConfig;
 export type AgentMcpServers = Record<string, AgentMcpServerConfig>;
 export type PermissionProfile = 'read-only' | 'dev-safe' | 'full';
+export type AgentProvider = 'claude' | 'ollama';
 
 export type PolicyPreset = 'safe' | 'balanced' | 'power';
 
@@ -36,7 +37,9 @@ export interface AgentConfig {
   deviceId: string;
   deviceName?: string;
   deviceToken: string;
+  provider?: AgentProvider;
   model: string;
+  ollamaBaseUrl?: string;
   permissionProfile?: PermissionProfile;
   identity: AgentIdentity;
   mcpServers?: AgentMcpServers;

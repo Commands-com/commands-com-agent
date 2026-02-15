@@ -9,6 +9,8 @@ DEVICE_ID="${DEVICE_ID:-}"
 DEVICE_NAME="${DEVICE_NAME:-}"
 DEVICE_TOKEN="${DEVICE_TOKEN:-}"
 MODEL="${MODEL:-sonnet}"
+PROVIDER="${PROVIDER:-claude}"
+OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://localhost:11434}"
 PERMISSION_PROFILE="${PERMISSION_PROFILE:-dev-safe}"
 DEFAULT_CWD="${DEFAULT_CWD:-$HOME}"
 HEARTBEAT_MS="${HEARTBEAT_MS:-30000}"
@@ -82,10 +84,14 @@ if [[ "$INIT_AGENT" == "1" ]]; then
     echo "[agent] authenticating with gateway OAuth"
     LOGIN_ARGS=(
       --gateway-url "$GATEWAY_URL"
+      --provider "$PROVIDER"
       --model "$MODEL"
       --permission-profile "$PERMISSION_PROFILE"
       --mcp-config "$MCP_CONFIG"
     )
+    if [[ "$PROVIDER" == "ollama" ]]; then
+      LOGIN_ARGS+=(--ollama-base-url "$OLLAMA_BASE_URL")
+    fi
 
     if [[ -n "$DEVICE_ID" ]]; then
       LOGIN_ARGS+=(--device-id "$DEVICE_ID")
@@ -106,13 +112,19 @@ if [[ "$INIT_AGENT" == "1" ]]; then
     fi
 
     echo "[agent] manual init using device token"
-    node dist/index.js init \
-      --gateway-url "$GATEWAY_URL" \
-      --device-id "$DEVICE_ID" \
-      --device-token "$DEVICE_TOKEN" \
-      --model "$MODEL" \
-      --permission-profile "$PERMISSION_PROFILE" \
+    INIT_ARGS=(
+      --gateway-url "$GATEWAY_URL"
+      --provider "$PROVIDER"
+      --device-id "$DEVICE_ID"
+      --device-token "$DEVICE_TOKEN"
+      --model "$MODEL"
+      --permission-profile "$PERMISSION_PROFILE"
       --mcp-config "$MCP_CONFIG"
+    )
+    if [[ "$PROVIDER" == "ollama" ]]; then
+      INIT_ARGS+=(--ollama-base-url "$OLLAMA_BASE_URL")
+    fi
+    node dist/index.js init "${INIT_ARGS[@]}"
   fi
 fi
 
@@ -120,16 +132,20 @@ echo "[agent] starting runtime"
 if [[ "$INIT_AGENT" == "0" ]]; then
   echo "[agent] using existing config at $CONFIG_FILE (skip init/login)"
 fi
-echo "[agent] gateway=$GATEWAY_URL model=$MODEL permission_profile=$PERMISSION_PROFILE cwd=$DEFAULT_CWD heartbeat_ms=$HEARTBEAT_MS auth_mode=$AUTH_MODE init_agent=$INIT_AGENT audit_log=$AUDIT_LOG_PATH mcp_config=$MCP_CONFIG mcp_filesystem_enabled=$MCP_FILESYSTEM_ENABLED"
+echo "[agent] gateway=$GATEWAY_URL provider=$PROVIDER model=$MODEL permission_profile=$PERMISSION_PROFILE cwd=$DEFAULT_CWD heartbeat_ms=$HEARTBEAT_MS auth_mode=$AUTH_MODE init_agent=$INIT_AGENT audit_log=$AUDIT_LOG_PATH mcp_config=$MCP_CONFIG mcp_filesystem_enabled=$MCP_FILESYSTEM_ENABLED ollama_base_url=$OLLAMA_BASE_URL"
 
 START_ARGS=(
   --default-cwd "$DEFAULT_CWD"
   --heartbeat-ms "$HEARTBEAT_MS"
   --audit-log-path "$AUDIT_LOG_PATH"
+  --provider "$PROVIDER"
   --model "$MODEL"
   --permission-profile "$PERMISSION_PROFILE"
   --mcp-config "$MCP_CONFIG"
 )
+if [[ "$PROVIDER" == "ollama" ]]; then
+  START_ARGS+=(--ollama-base-url "$OLLAMA_BASE_URL")
+fi
 
 if [[ -n "$SYSTEM_PROMPT" ]]; then
   START_ARGS+=(--system-prompt "$SYSTEM_PROMPT")

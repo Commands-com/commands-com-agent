@@ -13,13 +13,14 @@ import {
 } from './config.js';
 import { generateIdentity, shortFingerprint } from './crypto.js';
 import { runPrompt } from './claude.js';
+import { runOllamaPrompt } from './ollama.js';
 import { gatewayHealth, registerIdentityKey } from './gateway.js';
 import { acknowledgeHandshake } from './handshake.js';
 import { startRuntime } from './runtime.js';
 import { describeMcpServers, loadMcpServersFromFile } from './mcp.js';
 import { refreshGatewayOAuthToken, runGatewayOAuthLogin } from './oauth.js';
 import { createDefaultPolicy } from './policy.js';
-import type { AgentConfig, AgentMcpServers, PermissionProfile } from './types.js';
+import type { AgentConfig, AgentMcpServers, AgentProvider, PermissionProfile } from './types.js';
 
 type ParsedArgs = {
   command: string;
@@ -95,6 +96,61 @@ function isPermissionProfile(value: string): value is PermissionProfile {
   return value === 'read-only' || value === 'dev-safe' || value === 'full';
 }
 
+function isAgentProvider(value: string): value is AgentProvider {
+  return value === 'claude' || value === 'ollama';
+}
+
+function resolveProvider(candidate: string | undefined, fallback: AgentProvider = 'claude'): AgentProvider {
+  if (candidate && candidate.trim().length > 0) {
+    const normalized = candidate.trim().toLowerCase();
+    if (!isAgentProvider(normalized)) {
+      throw new Error(`Invalid provider "${candidate}". Use claude or ollama.`);
+    }
+    return normalized;
+  }
+  return fallback;
+}
+
+function defaultModelForProvider(provider: AgentProvider): string {
+  if (provider === 'ollama') {
+    return 'llama3.2';
+  }
+  return 'sonnet';
+}
+
+const DEFAULT_OLLAMA_BASE_URL = 'http://localhost:11434';
+const LOCAL_OLLAMA_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+
+function normalizeOllamaBaseUrl(input: string | undefined): string {
+  const raw = (input || DEFAULT_OLLAMA_BASE_URL).trim();
+  if (!raw) {
+    return DEFAULT_OLLAMA_BASE_URL;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`Invalid Ollama base URL: ${raw}`);
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`Invalid Ollama protocol: ${parsed.protocol}`);
+  }
+  if (!LOCAL_OLLAMA_HOSTS.has(parsed.hostname)) {
+    throw new Error(`Ollama host must be loopback (localhost/127.0.0.1/::1): ${parsed.hostname}`);
+  }
+  if (parsed.username || parsed.password) {
+    throw new Error('Ollama URL cannot include auth credentials');
+  }
+
+  parsed.pathname = '';
+  parsed.search = '';
+  parsed.hash = '';
+  const normalized = parsed.toString();
+  return normalized.endsWith('/') ? normalized.slice(0, -1) : normalized;
+}
+
 function resolvePermissionProfile(
   candidate: string | undefined,
   fallback: PermissionProfile = 'dev-safe'
@@ -150,7 +206,7 @@ Commands:
   login           Browser OAuth (Firebase) device registration
   init            Manual initialization with device token (headless fallback)
   status          Show local config status and gateway health
-  run             Execute a local Claude prompt via Claude Agent SDK
+  run             Execute a local prompt using configured provider (Claude/Ollama)
   ack-handshake   Create/sign/post handshake ack to gateway
   start           Start always-on websocket runtime with reconnect
 
@@ -160,13 +216,19 @@ Examples:
   commands-agent login --gateway-url https://api.commands.com --headless
   commands-agent init --gateway-url https://api.commands.com --device-id dev_123 --device-token <token>
   commands-agent run --prompt "Summarize this repository" --cwd /Users/me/Code/app --permission-profile read-only
+  commands-agent start --provider ollama --model llama3.2 --ollama-base-url http://localhost:11434
   commands-agent start --default-cwd /Users/me/Code --heartbeat-ms 15000 --audit-log-path ~/.commands-agent/audit.log --permission-profile dev-safe
 `);
 }
 
 async function cmdLogin(flags: Map<string, string>): Promise<void> {
   const gatewayUrl = normalizeGatewayUrl(optional(flags, 'gateway-url', 'https://api.commands.com'));
-  const model = optional(flags, 'model', 'sonnet');
+  const existing = await loadConfig();
+  const provider = resolveProvider(flags.get('provider')?.trim(), existing?.provider ?? 'claude');
+  const model = optional(flags, 'model', defaultModelForProvider(provider));
+  const ollamaBaseUrl = provider === 'ollama'
+    ? normalizeOllamaBaseUrl(flags.get('ollama-base-url')?.trim() || existing?.ollamaBaseUrl)
+    : undefined;
   const scope = optional(flags, 'scope', 'read_assets write_assets offline_access device');
   const clientId = optional(flags, 'client-id', 'commands-agent');
   const timeoutSeconds = parseIntStrict(optional(flags, 'timeout-seconds', '300'), 'timeout-seconds');
@@ -187,7 +249,6 @@ async function cmdLogin(flags: Map<string, string>): Promise<void> {
 
   const requestedDeviceID = flags.get('device-id')?.trim();
   const requestedDeviceName = flags.get('device-name')?.trim();
-  const existing = await loadConfig();
   const defaultPermissionProfile = resolvePermissionProfile(existing?.permissionProfile, 'dev-safe');
   const permissionProfile = resolvePermissionProfile(flags.get('permission-profile')?.trim(), defaultPermissionProfile);
   const canReuseExisting =
@@ -209,7 +270,9 @@ async function cmdLogin(flags: Map<string, string>): Promise<void> {
     deviceId,
     ...(deviceName ? { deviceName } : {}),
     deviceToken: oauth.accessToken,
+    provider,
     model,
+    ...(ollamaBaseUrl ? { ollamaBaseUrl } : {}),
     permissionProfile,
     identity,
     ...(mcpServers ? { mcpServers } : {}),
@@ -255,7 +318,12 @@ async function cmdInit(flags: Map<string, string>): Promise<void> {
   const gatewayUrl = normalizeGatewayUrl(optional(flags, 'gateway-url', 'https://api.commands.com'));
   const deviceId = required(flags, 'device-id');
   const deviceToken = required(flags, 'device-token');
-  const model = optional(flags, 'model', 'sonnet');
+  const existing = await loadConfig();
+  const provider = resolveProvider(flags.get('provider')?.trim(), existing?.provider ?? 'claude');
+  const model = optional(flags, 'model', defaultModelForProvider(provider));
+  const ollamaBaseUrl = provider === 'ollama'
+    ? normalizeOllamaBaseUrl(flags.get('ollama-base-url')?.trim() || existing?.ollamaBaseUrl)
+    : undefined;
   const permissionProfile = resolvePermissionProfile(flags.get('permission-profile')?.trim(), 'dev-safe');
 
   const mcpServers = await resolveMcpServers(flags, undefined);
@@ -266,7 +334,9 @@ async function cmdInit(flags: Map<string, string>): Promise<void> {
     gatewayUrl,
     deviceId,
     deviceToken,
+    provider,
     model,
+    ...(ollamaBaseUrl ? { ollamaBaseUrl } : {}),
     permissionProfile,
     identity,
     ...(mcpServers ? { mcpServers } : {}),
@@ -303,11 +373,14 @@ async function cmdStatus(flags: Map<string, string>): Promise<void> {
   const gatewayHealthState = health.ok ? (health.data?.status ?? 'ok') : `DOWN (${health.error})`;
 
   if (hasFlag(flags, 'json')) {
+    const provider = config.provider ?? 'claude';
     const payload = {
       configPath: CONFIG_PATH,
       gateway: config.gatewayUrl,
       deviceId: config.deviceId,
+      provider,
       model: config.model,
+      ollamaBaseUrl: provider === 'ollama' ? (config.ollamaBaseUrl ?? DEFAULT_OLLAMA_BASE_URL) : null,
       permissionProfile: config.permissionProfile ?? 'dev-safe',
       mcpServers: config.mcpServers ? Object.keys(config.mcpServers) : [],
       identityFingerprint: shortFingerprint(config.identity.publicKeyRawBase64),
@@ -323,7 +396,11 @@ async function cmdStatus(flags: Map<string, string>): Promise<void> {
   console.log(`Config file: ${CONFIG_PATH}`);
   console.log(`Gateway: ${config.gatewayUrl}`);
   console.log(`Device: ${config.deviceId}`);
+  console.log(`Provider: ${config.provider ?? 'claude'}`);
   console.log(`Model: ${config.model}`);
+  if ((config.provider ?? 'claude') === 'ollama') {
+    console.log(`Ollama base URL: ${config.ollamaBaseUrl ?? DEFAULT_OLLAMA_BASE_URL}`);
+  }
   console.log(`Permission profile: ${config.permissionProfile ?? 'dev-safe'}`);
   console.log(`MCP servers: ${describeMcpServers(config.mcpServers)}`);
   console.log(`Identity fingerprint: ${shortFingerprint(config.identity.publicKeyRawBase64)}`);
@@ -339,8 +416,14 @@ async function cmdStatus(flags: Map<string, string>): Promise<void> {
 
 async function cmdRun(flags: Map<string, string>, positionals: string[]): Promise<void> {
   const config = await requireConfig();
+  const provider = resolveProvider(flags.get('provider')?.trim(), config.provider ?? 'claude');
+  const model = flags.get('model')?.trim() ||
+    (provider === (config.provider ?? 'claude') ? config.model : defaultModelForProvider(provider));
   const cwd = optional(flags, 'cwd', process.cwd());
   const permissionProfile = resolvePermissionProfile(flags.get('permission-profile')?.trim(), config.permissionProfile ?? 'dev-safe');
+  const ollamaBaseUrl = provider === 'ollama'
+    ? normalizeOllamaBaseUrl(flags.get('ollama-base-url')?.trim() || config.ollamaBaseUrl)
+    : undefined;
   const promptFromFlag = flags.get('prompt')?.trim() ?? '';
   const promptFromPositional = positionals.join(' ').trim();
   const prompt = promptFromFlag || promptFromPositional;
@@ -357,15 +440,24 @@ async function cmdRun(flags: Map<string, string>, positionals: string[]): Promis
   if (mcpServers) {
     console.log(`MCP servers: ${describeMcpServers(mcpServers)}`);
   }
+  console.log(`Provider: ${provider}`);
+  console.log(`Model: ${model}`);
   console.log(`Permission profile: ${permissionProfile}`);
 
-  const result = await runPrompt({
-    prompt,
-    cwd,
-    model: config.model,
-    mcpServers,
-    policy: createRuntimePolicy(permissionProfile, cwd),
-  });
+  const result = provider === 'ollama'
+    ? await runOllamaPrompt({
+        prompt,
+        model,
+        systemPrompt: config.systemPrompt,
+        ollamaBaseUrl,
+      })
+    : await runPrompt({
+        prompt,
+        cwd,
+        model,
+        mcpServers,
+        policy: createRuntimePolicy(permissionProfile, cwd),
+      });
 
   console.log('\n=== Final Result ===');
   console.log(result.result || '(empty result)');
@@ -401,6 +493,7 @@ async function cmdAckHandshake(flags: Map<string, string>): Promise<void> {
 
 async function cmdStart(flags: Map<string, string>): Promise<void> {
   const config = await requireConfig();
+  const selectedProvider = resolveProvider(flags.get('provider')?.trim(), config.provider ?? 'claude');
 
   const defaultCwd = optional(flags, 'default-cwd', process.cwd());
   const heartbeatMs = parseIntStrict(optional(flags, 'heartbeat-ms', '15000'), 'heartbeat-ms');
@@ -408,7 +501,12 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
   const reconnectMaxMs = parseIntStrict(optional(flags, 'reconnect-max-ms', '30000'), 'reconnect-max-ms');
   const auditLogPath = optional(flags, 'audit-log-path', path.join(CONFIG_DIR, 'audit.log'));
   const modelOverride = flags.get('model')?.trim();
-  const selectedModel = modelOverride && modelOverride.length > 0 ? modelOverride : config.model;
+  const selectedModel = modelOverride && modelOverride.length > 0
+    ? modelOverride
+    : config.model || defaultModelForProvider(selectedProvider);
+  const selectedOllamaBaseUrl = selectedProvider === 'ollama'
+    ? normalizeOllamaBaseUrl(flags.get('ollama-base-url')?.trim() || config.ollamaBaseUrl)
+    : undefined;
   const permissionProfile = resolvePermissionProfile(
     flags.get('permission-profile')?.trim(),
     config.permissionProfile ?? 'dev-safe'
@@ -425,7 +523,9 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
   const mcpServers = await resolveMcpServers(flags, config.mcpServers);
   const effectiveConfig: AgentConfig = {
     ...config,
+    provider: selectedProvider,
     model: selectedModel,
+    ...(selectedOllamaBaseUrl ? { ollamaBaseUrl: selectedOllamaBaseUrl } : {}),
     permissionProfile,
     policy: runtimePolicy,
     ...(mcpServers ? { mcpServers } : {}),
@@ -437,9 +537,20 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
     await saveConfig(persistable);
   };
 
-  if (effectiveConfig.model !== config.model || effectiveConfig.permissionProfile !== config.permissionProfile) {
+  if (
+    effectiveConfig.provider !== (config.provider ?? 'claude') ||
+    effectiveConfig.model !== config.model ||
+    effectiveConfig.permissionProfile !== config.permissionProfile ||
+    (effectiveConfig.ollamaBaseUrl ?? '') !== (config.ollamaBaseUrl ?? '')
+  ) {
+    if (effectiveConfig.provider !== (config.provider ?? 'claude')) {
+      console.log(`[runtime] provider override: ${effectiveConfig.provider} (was ${config.provider ?? 'claude'})`);
+    }
     if (effectiveConfig.model !== config.model) {
       console.log(`[runtime] model override: ${effectiveConfig.model} (was ${config.model})`);
+    }
+    if ((effectiveConfig.ollamaBaseUrl ?? '') !== (config.ollamaBaseUrl ?? '')) {
+      console.log(`[runtime] ollama base url: ${effectiveConfig.ollamaBaseUrl ?? DEFAULT_OLLAMA_BASE_URL}`);
     }
     if (effectiveConfig.permissionProfile !== config.permissionProfile) {
       console.log(
@@ -555,7 +666,11 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
 
   console.log('[runtime] starting commands-agent websocket runtime');
   console.log(`[runtime] gateway=${effectiveConfig.gatewayUrl} device=${effectiveConfig.deviceId}`);
+  console.log(`[runtime] provider=${effectiveConfig.provider ?? 'claude'}`);
   console.log(`[runtime] model=${effectiveConfig.model}`);
+  if ((effectiveConfig.provider ?? 'claude') === 'ollama') {
+    console.log(`[runtime] ollama-base-url=${effectiveConfig.ollamaBaseUrl ?? DEFAULT_OLLAMA_BASE_URL}`);
+  }
   console.log(`[runtime] permission-profile=${effectiveConfig.permissionProfile ?? 'dev-safe'}`);
   console.log(`[runtime] default-cwd=${defaultCwd}`);
   console.log(`[runtime] audit-log=${auditLogPath}`);

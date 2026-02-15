@@ -4,8 +4,10 @@
 
 import {
   loadProfiles, getProfile, invalidateProfileCache, slugify, escapeHtml, infoIcon,
-  MODEL_OPTIONS, PERMISSION_OPTIONS, DEFAULT_GATEWAY_URL,
+  CLAUDE_MODEL_OPTIONS, PERMISSION_OPTIONS, PROVIDER_OPTIONS, DEFAULT_GATEWAY_URL,
 } from '../state.js';
+
+const DEFAULT_OLLAMA_BASE_URL = 'http://localhost:11434';
 
 const CREATE_TABS = [
   { key: 'identity', label: 'Identity' },
@@ -102,7 +104,9 @@ function renderForm(container, profile, isEdit) {
       deviceNameManuallySet: manuallySet,
       systemPrompt: formState.systemPrompt || '',
       workspace: formState.workspace?.trim() || '',
+      provider: formState.provider || 'claude',
       model: formState.model || 'sonnet',
+      ollamaBaseUrl: formState.ollamaBaseUrl?.trim() || DEFAULT_OLLAMA_BASE_URL,
       permissions: formState.permissions || 'dev-safe',
       gatewayUrl: formState.gatewayUrl?.trim() || '',
       auditLogPath: formState.auditLogPath?.trim() || '',
@@ -131,13 +135,31 @@ function renderForm(container, profile, isEdit) {
 // In-memory form state that persists across tab switches
 let formState = {};
 
+function autoDeviceSlug(nameValue) {
+  const raw = String(nameValue || '').trim();
+  if (!raw) return '';
+  return slugify(raw);
+}
+
+function inferProvider(profile) {
+  if (profile?.provider === 'ollama' || profile?.provider === 'claude') {
+    return profile.provider;
+  }
+  return 'claude';
+}
+
 function initFormState(profile) {
+  const provider = inferProvider(profile);
   formState = {
     name: profile?.name || '',
     deviceName: profile?.deviceName || '',
     systemPrompt: profile?.systemPrompt || '',
     workspace: profile?.workspace || '',
-    model: profile?.model || 'sonnet',
+    provider,
+    model: profile?.model || (provider === 'ollama' ? 'llama3.2' : 'sonnet'),
+    ollamaBaseUrl: profile?.ollamaBaseUrl || DEFAULT_OLLAMA_BASE_URL,
+    ollamaModels: [],
+    ollamaStatus: '',
     permissions: profile?.permissions || 'dev-safe',
     gatewayUrl: profile?.gatewayUrl || '',
     auditLogPath: profile?.auditLogPath || '',
@@ -158,13 +180,17 @@ function captureValues(container, _profile) {
       if (sp) formState.systemPrompt = sp.value;
       const ws = container.querySelector('#agent-workspace');
       if (ws) formState.workspace = ws.value;
-      const autoSlug = slugify(formState.name);
+      const autoSlug = autoDeviceSlug(formState.name);
       manuallySet = formState.deviceName !== autoSlug;
       break;
     }
     case 'config': {
+      const pr = container.querySelector('#agent-provider');
+      if (pr) formState.provider = pr.value;
       const m = container.querySelector('#agent-model');
       if (m) formState.model = m.value;
+      const ob = container.querySelector('#agent-ollama-base-url');
+      if (ob) formState.ollamaBaseUrl = ob.value;
       const p = container.querySelector('#agent-permissions');
       if (p) formState.permissions = p.value;
       const gw = container.querySelector('#agent-gateway-url');
@@ -194,7 +220,7 @@ function renderSubContent(container, profile, isEdit) {
       renderIdentityTab(el, profile, isEdit, container);
       break;
     case 'config':
-      renderConfigTab(el);
+      renderConfigTab(el, container, profile, isEdit);
       break;
     case 'mcp':
       renderMcpTab(el);
@@ -252,12 +278,12 @@ function renderIdentityTab(el, profile, isEdit, container) {
 
   nameInput?.addEventListener('input', () => {
     if (!manuallySet) {
-      deviceNameInput.value = slugify(nameInput.value);
+      deviceNameInput.value = autoDeviceSlug(nameInput.value);
     }
   });
 
   deviceNameInput?.addEventListener('input', () => {
-    const autoSlug = slugify(nameInput.value);
+    const autoSlug = autoDeviceSlug(nameInput.value);
     manuallySet = deviceNameInput.value !== autoSlug;
   });
 
@@ -278,8 +304,12 @@ function renderIdentityTab(el, profile, isEdit, container) {
   }
 }
 
-function renderConfigTab(el) {
-  const modelOpts = MODEL_OPTIONS.map((o) =>
+function renderConfigTab(el, container, profile, isEdit) {
+  const providerOpts = PROVIDER_OPTIONS.map((o) =>
+    `<option value="${o.value}"${o.value === formState.provider ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
+  ).join('');
+
+  const modelOpts = CLAUDE_MODEL_OPTIONS.map((o) =>
     `<option value="${o.value}"${o.value === formState.model ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
   ).join('');
 
@@ -287,13 +317,55 @@ function renderConfigTab(el) {
     `<option value="${o.value}"${o.value === formState.permissions ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
   ).join('');
 
-  el.innerHTML = `
-    <div class="card">
-      <div class="field-grid">
+  const ollamaModelValues = Array.isArray(formState.ollamaModels)
+    ? [...new Set(formState.ollamaModels.map((m) => String(m || '').trim()).filter(Boolean))]
+    : [];
+  const currentOllamaModel = String(formState.model || '').trim();
+  const ollamaOptions = [...ollamaModelValues];
+  if (currentOllamaModel && !ollamaOptions.includes(currentOllamaModel)) {
+    ollamaOptions.unshift(currentOllamaModel);
+  }
+  if (ollamaOptions.length === 0) {
+    ollamaOptions.push('llama3.2');
+  }
+  const ollamaModelOptions = ollamaOptions
+    .map((m) => {
+      const isCurrentOnly = m === currentOllamaModel && !ollamaModelValues.includes(m);
+      const label = isCurrentOnly ? `${m} (current)` : m;
+      return `<option value="${escapeHtml(m)}"${m === currentOllamaModel ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+    })
+    .join('');
+
+  const ollamaStatus = formState.ollamaStatus
+    ? `<p class="hint" style="margin-top: 8px;">${escapeHtml(formState.ollamaStatus)}</p>`
+    : '';
+
+  const modelField = formState.provider === 'ollama'
+    ? `
+        <label>
+          <span>Model</span>
+          <select id="agent-model">${ollamaModelOptions}</select>
+        </label>
+        <label>
+          <span>Ollama Base URL</span>
+          <input type="text" id="agent-ollama-base-url" value="${escapeHtml(formState.ollamaBaseUrl || DEFAULT_OLLAMA_BASE_URL)}" placeholder="${DEFAULT_OLLAMA_BASE_URL}" />
+        </label>
+      `
+    : `
         <label>
           <span>Model</span>
           <select id="agent-model">${modelOpts}</select>
         </label>
+      `;
+
+  el.innerHTML = `
+    <div class="card">
+      <div class="field-grid">
+        <label>
+          <span>Provider</span>
+          <select id="agent-provider">${providerOpts}</select>
+        </label>
+        ${modelField}
         <label>
           <span>Permissions</span>
           <select id="agent-permissions">${permOpts}</select>
@@ -307,8 +379,46 @@ function renderConfigTab(el) {
           <input type="text" id="agent-audit-log-path" value="${escapeHtml(formState.auditLogPath)}" placeholder="~/.commands-agent/audit.log" />
         </label>
       </div>
+      ${formState.provider === 'ollama' ? `
+        <div class="row" style="margin-top: 10px;">
+          <button id="agent-refresh-ollama-models" style="font-size: 12px;">Refresh Ollama Models</button>
+        </div>
+        ${ollamaStatus}
+      ` : ''}
     </div>
   `;
+
+  const providerEl = el.querySelector('#agent-provider');
+  providerEl?.addEventListener('change', () => {
+    formState.provider = providerEl.value;
+    if (formState.provider === 'claude' && !['opus', 'sonnet', 'haiku'].includes(formState.model)) {
+      formState.model = 'sonnet';
+    }
+    if (formState.provider === 'ollama' && ['opus', 'sonnet', 'haiku'].includes(formState.model)) {
+      formState.model = 'llama3.2';
+    }
+    formState.ollamaStatus = '';
+    renderSubContent(container, profile, isEdit);
+  });
+
+  const refreshBtn = el.querySelector('#agent-refresh-ollama-models');
+  refreshBtn?.addEventListener('click', async () => {
+    const baseUrlEl = el.querySelector('#agent-ollama-base-url');
+    const baseUrl = baseUrlEl?.value || formState.ollamaBaseUrl || DEFAULT_OLLAMA_BASE_URL;
+    const result = await window.commandsDesktop.ollama.listModels(baseUrl);
+    if (!result?.ok) {
+      formState.ollamaStatus = result?.error || 'Failed to load models';
+      renderSubContent(container, profile, isEdit);
+      return;
+    }
+    formState.ollamaBaseUrl = result.baseUrl || baseUrl;
+    formState.ollamaModels = Array.isArray(result.models) ? result.models : [];
+    if (!formState.model && formState.ollamaModels.length > 0) {
+      formState.model = formState.ollamaModels[0];
+    }
+    formState.ollamaStatus = `Loaded ${formState.ollamaModels.length} model(s)`;
+    renderSubContent(container, profile, isEdit);
+  });
 }
 
 function renderMcpTab(el) {

@@ -16,7 +16,10 @@ const PROFILES_INDEX = path.join(PROFILES_DIR, 'profiles.json');
 const DEFAULT_AGENT_ROOT = path.resolve(__dirname, '..');
 const DEFAULT_GATEWAY_URL = 'https://api.commands.com';
 const DESKTOP_SETTINGS_PATH = path.join(os.homedir(), '.commands-agent', 'desktop-settings.json');
-const VALID_MODELS = ['opus', 'sonnet', 'haiku'];
+const CLAUDE_MODELS = ['opus', 'sonnet', 'haiku'];
+const VALID_PROVIDERS = ['claude', 'ollama'];
+const DEFAULT_OLLAMA_BASE_URL = 'http://localhost:11434';
+const OLLAMA_LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 const VALID_PERMISSIONS = ['read-only', 'dev-safe', 'full'];
 const PROFILE_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 const PROFILE_DEVICE_ID_RE = /^dev_[a-f0-9]{32}$/;
@@ -340,6 +343,77 @@ function normalizeProfileGatewayUrl(value) {
     return parsed.origin;
   } catch {
     return '';
+  }
+}
+
+function normalizeProfileProvider(value, fallback = 'claude') {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  const normalized = value.trim().toLowerCase();
+  return VALID_PROVIDERS.includes(normalized) ? normalized : fallback;
+}
+
+function normalizeOllamaBaseUrl(value) {
+  const raw = typeof value === 'string' && value.trim() ? value.trim() : DEFAULT_OLLAMA_BASE_URL;
+
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return '';
+  }
+
+  if (parsed.username || parsed.password) {
+    return '';
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return '';
+  }
+  if (!OLLAMA_LOCAL_HOSTS.has(parsed.hostname)) {
+    return '';
+  }
+
+  parsed.pathname = '';
+  parsed.search = '';
+  parsed.hash = '';
+  const normalized = parsed.toString();
+  return normalized.endsWith('/') ? normalized.slice(0, -1) : normalized;
+}
+
+async function listOllamaModels(baseUrlInput) {
+  const baseUrl = normalizeOllamaBaseUrl(baseUrlInput);
+  if (!baseUrl) {
+    throw new Error('Invalid Ollama base URL');
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(`${baseUrl}/api/tags`, {
+      method: 'GET',
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Ollama tags request failed (${response.status})`);
+    }
+
+    const payload = await response.json();
+    const rawModels = Array.isArray(payload?.models) ? payload.models : [];
+    const modelNames = [];
+    const seen = new Set();
+    for (const model of rawModels) {
+      const name = typeof model?.name === 'string' ? model.name.trim() : '';
+      if (!name || name.length > 200) continue;
+      if (seen.has(name)) continue;
+      seen.add(name);
+      modelNames.push(name);
+    }
+    modelNames.sort((a, b) => a.localeCompare(b));
+    return { baseUrl, models: modelNames };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -753,8 +827,19 @@ function buildAgentEnv(launchProfile, runtimeOptions, agentRoot) {
     }
   }
 
-  if (typeof launchProfile?.model === 'string' && launchProfile.model.trim()) {
-    env.MODEL = launchProfile.model.trim();
+  const provider = normalizeProfileProvider(launchProfile?.provider, 'claude');
+  env.PROVIDER = provider;
+
+  const launchModel = typeof launchProfile?.model === 'string' ? launchProfile.model.trim() : '';
+  if (launchModel) {
+    env.MODEL = launchModel;
+  } else {
+    env.MODEL = provider === 'ollama' ? 'llama3.2' : 'sonnet';
+  }
+
+  if (provider === 'ollama') {
+    const ollamaBaseUrl = normalizeOllamaBaseUrl(launchProfile?.ollamaBaseUrl) || DEFAULT_OLLAMA_BASE_URL;
+    env.OLLAMA_BASE_URL = ollamaBaseUrl;
   }
 
   if (typeof launchProfile?.permissions === 'string' && launchProfile.permissions.trim()) {
@@ -931,6 +1016,31 @@ async function startAgent(payload = {}) {
     headless: payload?.headless === true,
   };
   const env = buildAgentEnv(launchProfile, runtimeOptions, agentRoot);
+
+  if (env.PROVIDER === 'ollama') {
+    let ollamaModels;
+    try {
+      const probe = await listOllamaModels(env.OLLAMA_BASE_URL || DEFAULT_OLLAMA_BASE_URL);
+      ollamaModels = probe.models;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return {
+        ok: false,
+        error: `Ollama is unavailable (${msg}). Start Ollama and retry.`,
+        status: snapshotAgentState()
+      };
+    }
+
+    const selectedModel = typeof env.MODEL === 'string' ? env.MODEL.trim() : '';
+    if (selectedModel && !ollamaModels.includes(selectedModel)) {
+      return {
+        ok: false,
+        error: `Ollama model "${selectedModel}" is not installed. Pull it in Ollama or select another model.`,
+        status: snapshotAgentState()
+      };
+    }
+  }
+
   let child;
   try {
     child = spawn('/usr/bin/env', ['bash', scriptPath], {
@@ -972,7 +1082,9 @@ async function startAgent(payload = {}) {
     deviceId: env.DEVICE_ID || null,
     deviceName: env.DEVICE_NAME || null,
     defaultCwd: env.DEFAULT_CWD || null,
+    provider: env.PROVIDER || 'claude',
     model: env.MODEL || null,
+    ollamaBaseUrl: env.OLLAMA_BASE_URL || null,
     permissionProfile: env.PERMISSION_PROFILE || null,
     mcpFilesystemEnabled: env.MCP_FILESYSTEM_ENABLED || null,
     auditLogPath: env.AUDIT_LOG_PATH || defaultAuditLogPath(launchProfile?.id),
@@ -1564,6 +1676,9 @@ function migrateProfile(profile) {
   if (!normalizeProfileDeviceId(profile.deviceId)) {
     profile.deviceId = generateProfileDeviceId();
   }
+  const inferredProvider = 'claude';
+  profile.provider = normalizeProfileProvider(profile.provider, inferredProvider);
+  profile.ollamaBaseUrl = normalizeOllamaBaseUrl(profile.ollamaBaseUrl) || DEFAULT_OLLAMA_BASE_URL;
   return profile;
 }
 
@@ -1631,9 +1746,28 @@ function sanitizeProfilePayload(incoming) {
     allowed.workspace = incoming.workspace;
   }
 
+  // provider
+  if (typeof incoming.provider === 'string') {
+    const provider = normalizeProfileProvider(incoming.provider, '');
+    if (provider) {
+      allowed.provider = provider;
+    }
+  }
+
   // model
-  if (typeof incoming.model === 'string' && VALID_MODELS.includes(incoming.model)) {
-    allowed.model = incoming.model;
+  if (typeof incoming.model === 'string') {
+    const model = incoming.model.trim();
+    if (model && model.length <= 200) {
+      allowed.model = model;
+    }
+  }
+
+  // ollamaBaseUrl — local-only URL
+  if (typeof incoming.ollamaBaseUrl === 'string') {
+    const normalizedOllamaBaseUrl = normalizeOllamaBaseUrl(incoming.ollamaBaseUrl);
+    if (normalizedOllamaBaseUrl) {
+      allowed.ollamaBaseUrl = normalizedOllamaBaseUrl;
+    }
   }
 
   // permissions
@@ -1804,6 +1938,8 @@ ipcMain.handle('desktop:profiles:save', async (_event, payload) => {
 
       const deviceName = resolveDeviceName(sanitized, allProfiles);
       const normalizedAuditLogPath = normalizeProfileAuditLogPath(sanitized.auditLogPath, id);
+      const provider = normalizeProfileProvider(sanitized.provider, 'claude');
+      const defaultModel = provider === 'ollama' ? 'llama3.2' : 'sonnet';
 
       profile = {
         version: 1,
@@ -1814,7 +1950,9 @@ ipcMain.handle('desktop:profiles:save', async (_event, payload) => {
         deviceNameManuallySet: sanitized.deviceNameManuallySet || false,
         systemPrompt: sanitized.systemPrompt || '',
         workspace: sanitized.workspace || '',
-        model: sanitized.model || 'sonnet',
+        provider,
+        model: sanitized.model || defaultModel,
+        ollamaBaseUrl: normalizeOllamaBaseUrl(sanitized.ollamaBaseUrl) || DEFAULT_OLLAMA_BASE_URL,
         permissions: sanitized.permissions || 'dev-safe',
         gatewayUrl: sanitized.gatewayUrl || '',
         auditLogPath: normalizedAuditLogPath,
@@ -1824,6 +1962,9 @@ ipcMain.handle('desktop:profiles:save', async (_event, payload) => {
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
+      if (profile.provider === 'claude' && !CLAUDE_MODELS.includes(profile.model)) {
+        profile.model = 'sonnet';
+      }
 
       // Create profile directory
       const profileDir = path.join(PROFILES_DIR, id);
@@ -1876,6 +2017,15 @@ ipcMain.handle('desktop:profiles:save', async (_event, payload) => {
         updatedAt: Date.now(),  // server-controlled
         version: existing.version,
       };
+
+      profile.provider = normalizeProfileProvider(profile.provider, 'claude');
+      if (!profile.model || typeof profile.model !== 'string' || !profile.model.trim()) {
+        profile.model = profile.provider === 'ollama' ? 'llama3.2' : 'sonnet';
+      }
+      if (profile.provider === 'claude' && !CLAUDE_MODELS.includes(profile.model)) {
+        profile.model = 'sonnet';
+      }
+      profile.ollamaBaseUrl = normalizeOllamaBaseUrl(profile.ollamaBaseUrl) || DEFAULT_OLLAMA_BASE_URL;
 
       // Resolve deviceName
       profile.deviceName = resolveDeviceName(profile, allProfiles);
@@ -2041,6 +2191,8 @@ ipcMain.handle('desktop:profiles:migrate', async (_event, payload) => {
     const id = generateProfileId();
     const name = legacyState.deviceName || legacyState.agentName || 'My Agent';
     const now = Date.now();
+    const provider = normalizeProfileProvider(legacyState.provider, 'claude');
+    const defaultModel = provider === 'ollama' ? 'llama3.2' : 'sonnet';
 
     const profile = {
       version: 1,
@@ -2051,7 +2203,9 @@ ipcMain.handle('desktop:profiles:migrate', async (_event, payload) => {
       deviceNameManuallySet: false,
       systemPrompt: legacyState.systemPrompt || '',
       workspace: legacyState.workspace || legacyState.defaultCwd || '',
-      model: legacyState.model || 'sonnet',
+      provider,
+      model: legacyState.model || defaultModel,
+      ollamaBaseUrl: normalizeOllamaBaseUrl(legacyState.ollamaBaseUrl) || DEFAULT_OLLAMA_BASE_URL,
       permissions: legacyState.permissionProfile || 'dev-safe',
       gatewayUrl: legacyState.gatewayUrl || '',
       auditLogPath: normalizeProfileAuditLogPath(legacyState.auditLogPath || '', id),
@@ -2061,6 +2215,9 @@ ipcMain.handle('desktop:profiles:migrate', async (_event, payload) => {
       createdAt: now,
       updatedAt: now,
     };
+    if (profile.provider === 'claude' && !CLAUDE_MODELS.includes(profile.model)) {
+      profile.model = 'sonnet';
+    }
 
     // Create profile directory and write
     const profileDir = path.join(PROFILES_DIR, id);
@@ -2104,6 +2261,21 @@ ipcMain.handle('desktop:auth:sign-out', async () => {
 
 ipcMain.handle('desktop:auth:status', async () => {
   return { ok: true, ...auth.getAuthStatus() };
+});
+
+// ---------------------------------------------------------------------------
+// Ollama IPC handlers
+// ---------------------------------------------------------------------------
+
+ipcMain.handle('desktop:ollama:list-models', async (_event, payload) => {
+  try {
+    const baseUrl = typeof payload?.baseUrl === 'string' ? payload.baseUrl : '';
+    const result = await listOllamaModels(baseUrl);
+    return { ok: true, baseUrl: result.baseUrl, models: result.models };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: message };
+  }
 });
 
 // ---------------------------------------------------------------------------

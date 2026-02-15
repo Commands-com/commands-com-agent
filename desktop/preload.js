@@ -123,6 +123,9 @@ contextBridge.exposeInMainWorld('commandsDesktop', {
     get: () => ipcRenderer.invoke('desktop:settings:get'),
     save: (settings) => ipcRenderer.invoke('desktop:settings:save', { settings }),
   },
+  ollama: {
+    listModels: (baseUrl) => ipcRenderer.invoke('desktop:ollama:list-models', { baseUrl }),
+  },
   readAuditLog: (payload) => ipcRenderer.invoke('desktop:audit:read', payload),
   startAgent: (payload) => ipcRenderer.invoke('desktop:agent:start', payload),
   stopAgent: (payload) => ipcRenderer.invoke('desktop:agent:stop', payload),

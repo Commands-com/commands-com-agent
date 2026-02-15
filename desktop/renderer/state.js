@@ -11,11 +11,17 @@ export const MAX_RUNTIME_LOG_LINES = 600;
 export const DEFAULT_AUDIT_LIMIT = 200;
 export const MAX_AUDIT_LIMIT = 2000;
 
-export const MODEL_OPTIONS = [
+export const PROVIDER_OPTIONS = [
+  { value: 'claude', label: 'Claude' },
+  { value: 'ollama', label: 'Ollama (local)' },
+];
+
+export const CLAUDE_MODEL_OPTIONS = [
   { value: 'opus', label: 'Opus (max quality)' },
   { value: 'sonnet', label: 'Sonnet (balanced)' },
   { value: 'haiku', label: 'Haiku (fast)' },
 ];
+export const MODEL_OPTIONS = CLAUDE_MODEL_OPTIONS;
 
 export const PERMISSION_OPTIONS = [
   { value: 'read-only', label: 'Read-Only' },
@@ -521,8 +527,11 @@ export function botIconSvg(size = 24, name) {
 /**
  * Format a model key for display.
  */
-export function formatModel(model) {
-  const opt = MODEL_OPTIONS.find((o) => o.value === model);
+export function formatModel(model, provider = 'claude') {
+  if (provider === 'ollama') {
+    return model || 'Ollama';
+  }
+  const opt = CLAUDE_MODEL_OPTIONS.find((o) => o.value === model);
   return opt ? opt.label : model || 'Sonnet';
 }
 

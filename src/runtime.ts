@@ -10,6 +10,7 @@ import { appendAuditEvent } from './audit.js';
 import { registerIdentityKey } from './gateway.js';
 import { acknowledgeHandshake } from './handshake.js';
 import { runPrompt } from './claude.js';
+import { runOllamaPrompt } from './ollama.js';
 
 export interface RuntimeOptions {
   defaultCwd: string;
@@ -789,15 +790,24 @@ class AgentRuntime {
     }
 
     try {
-      const result = await runPrompt({
-        prompt,
-        cwd,
-        model: this.config.model,
-        systemPrompt: this.config.systemPrompt,
-        resumeSessionId: session.claudeSessionId,
-        mcpServers: this.config.mcpServers,
-        policy: this.config.policy,
-      });
+      const provider = this.config.provider === 'ollama' ? 'ollama' : 'claude';
+      const result = provider === 'ollama'
+        ? await runOllamaPrompt({
+            prompt,
+            model: this.config.model,
+            systemPrompt: this.config.systemPrompt,
+            resumeSessionId: session.claudeSessionId,
+            ollamaBaseUrl: this.config.ollamaBaseUrl,
+          })
+        : await runPrompt({
+            prompt,
+            cwd,
+            model: this.config.model,
+            systemPrompt: this.config.systemPrompt,
+            resumeSessionId: session.claudeSessionId,
+            mcpServers: this.config.mcpServers,
+            policy: this.config.policy,
+          });
       if (result.sessionId) {
         session.claudeSessionId = result.sessionId;
         if (conversationId) {

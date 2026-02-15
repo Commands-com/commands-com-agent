@@ -5,7 +5,7 @@
 import {
   viewState, getProfile, invalidateProfileCache, loadProfiles,
   escapeHtml, formatModel, formatPermissions,
-  botIconSvg, slugify, infoIcon, MODEL_OPTIONS, PERMISSION_OPTIONS,
+  botIconSvg, slugify, infoIcon, CLAUDE_MODEL_OPTIONS, PROVIDER_OPTIONS, PERMISSION_OPTIONS,
   runtimeState, isProfileRunning, isAnyAgentRunning, runningProfileId,
   appendLog, clearLogs,
   auditState, resetAuditState, DEFAULT_AUDIT_LIMIT, MAX_AUDIT_LIMIT, clamp,
@@ -42,6 +42,13 @@ const TABS = [
 
 let currentProfile = null;
 let settingsSubTab = 'identity'; // identity | config | mcp | security
+const DEFAULT_OLLAMA_BASE_URL = 'http://localhost:11434';
+
+function autoDeviceSlug(nameValue) {
+  const raw = String(nameValue || '').trim();
+  if (!raw) return '';
+  return slugify(raw);
+}
 
 export async function renderAgentDetail(container, profileId) {
   if (!container || !profileId) return;
@@ -106,7 +113,7 @@ export async function renderAgentDetail(container, profileId) {
       <div class="detail-header-info">
         <h2>${escapeHtml(profile.name)}</h2>
         <div class="detail-header-meta">
-          <span>${escapeHtml(formatModel(profile.model))}</span>
+          <span>${escapeHtml(formatModel(profile.model, profile.provider || 'claude'))}</span>
           <span>${escapeHtml(formatPermissions(profile.permissions))}</span>
           ${profile.workspace ? `<span>${escapeHtml(profile.workspace)}</span>` : ''}
         </div>
@@ -695,14 +702,26 @@ const SETTINGS_SUB_TABS = [
 // from the DOM before each sub-tab switch so edits aren't lost.
 let settingsFormState = {};
 
+function inferProvider(profile) {
+  if (profile?.provider === 'claude' || profile?.provider === 'ollama') {
+    return profile.provider;
+  }
+  return 'claude';
+}
+
 function initSettingsFormState(profile) {
+  const provider = inferProvider(profile);
   settingsFormState = {
     name: profile.name || '',
     deviceName: profile.deviceName || '',
     deviceNameManuallySet: profile.deviceNameManuallySet || false,
     systemPrompt: profile.systemPrompt || '',
     workspace: profile.workspace || '',
-    model: profile.model || 'sonnet',
+    provider,
+    model: profile.model || (provider === 'ollama' ? 'llama3.2' : 'sonnet'),
+    ollamaBaseUrl: profile.ollamaBaseUrl || DEFAULT_OLLAMA_BASE_URL,
+    ollamaModels: [],
+    ollamaStatus: '',
     permissions: profile.permissions || 'dev-safe',
     gatewayUrl: profile.gatewayUrl || '',
     auditLogPath: profile.auditLogPath || '',
@@ -723,13 +742,17 @@ function captureSettingsValues(container) {
       if (sp) settingsFormState.systemPrompt = sp.value;
       const ws = container.querySelector('#s-workspace');
       if (ws) settingsFormState.workspace = ws.value.trim();
-      const autoSlug = slugify(settingsFormState.name);
+      const autoSlug = autoDeviceSlug(settingsFormState.name);
       settingsFormState.deviceNameManuallySet = settingsFormState.deviceName !== autoSlug;
       break;
     }
     case 'config': {
+      const pr = container.querySelector('#s-provider');
+      if (pr) settingsFormState.provider = pr.value;
       const m = container.querySelector('#s-model');
       if (m) settingsFormState.model = m.value;
+      const ob = container.querySelector('#s-ollama-base-url');
+      if (ob) settingsFormState.ollamaBaseUrl = ob.value.trim();
       const p = container.querySelector('#s-permissions');
       if (p) settingsFormState.permissions = p.value;
       const gw = container.querySelector('#s-gateway-url');
@@ -824,7 +847,9 @@ function gatherSettingsPayload(container, profile) {
     deviceNameManuallySet: settingsFormState.deviceNameManuallySet,
     systemPrompt: settingsFormState.systemPrompt,
     workspace: settingsFormState.workspace,
+    provider: settingsFormState.provider,
     model: settingsFormState.model,
+    ollamaBaseUrl: settingsFormState.ollamaBaseUrl,
     permissions: settingsFormState.permissions,
     gatewayUrl: settingsFormState.gatewayUrl,
     auditLogPath: settingsFormState.auditLogPath,
@@ -912,7 +937,7 @@ function renderSettingsIdentity(container, profile, extra) {
   const deviceNameInput = container.querySelector('#s-device-name');
   nameInput?.addEventListener('input', () => {
     if (!fs.deviceNameManuallySet) {
-      deviceNameInput.value = slugify(nameInput.value);
+      deviceNameInput.value = autoDeviceSlug(nameInput.value);
     }
   });
 
@@ -940,7 +965,11 @@ function renderSettingsIdentity(container, profile, extra) {
 
 function renderSettingsConfig(container, profile) {
   const fs = settingsFormState;
-  const modelOpts = MODEL_OPTIONS.map((o) =>
+  const providerOpts = PROVIDER_OPTIONS.map((o) =>
+    `<option value="${o.value}"${o.value === fs.provider ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
+  ).join('');
+
+  const modelOpts = CLAUDE_MODEL_OPTIONS.map((o) =>
     `<option value="${o.value}"${o.value === fs.model ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
   ).join('');
 
@@ -948,20 +977,64 @@ function renderSettingsConfig(container, profile) {
     `<option value="${o.value}"${o.value === fs.permissions ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
   ).join('');
 
+  const ollamaModelValues = Array.isArray(fs.ollamaModels)
+    ? [...new Set(fs.ollamaModels.map((m) => String(m || '').trim()).filter(Boolean))]
+    : [];
+  const currentOllamaModel = String(fs.model || '').trim();
+  const ollamaOptions = [...ollamaModelValues];
+  if (currentOllamaModel && !ollamaOptions.includes(currentOllamaModel)) {
+    ollamaOptions.unshift(currentOllamaModel);
+  }
+  if (ollamaOptions.length === 0) {
+    ollamaOptions.push('llama3.2');
+  }
+  const ollamaModelOptions = ollamaOptions
+    .map((m) => {
+      const isCurrentOnly = m === currentOllamaModel && !ollamaModelValues.includes(m);
+      const label = isCurrentOnly ? `${m} (current)` : m;
+      return `<option value="${escapeHtml(m)}"${m === currentOllamaModel ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+    })
+    .join('');
+
+  const modelField = fs.provider === 'ollama'
+    ? `
+        <label>
+          <span>Model</span>
+          <select id="s-model">${ollamaModelOptions}</select>
+        </label>
+        <label>
+          <span>Ollama Base URL</span>
+          <input type="text" id="s-ollama-base-url" value="${escapeHtml(fs.ollamaBaseUrl || DEFAULT_OLLAMA_BASE_URL)}" placeholder="${DEFAULT_OLLAMA_BASE_URL}" />
+        </label>
+      `
+    : `
+        <label>
+          <span>Model</span>
+          <select id="s-model">${modelOpts}</select>
+        </label>
+      `;
+
   container.innerHTML = `
     <div style="max-width: 580px;">
       <div class="card">
         <h3>Model & Permissions</h3>
         <div class="field-grid">
           <label>
-            <span>Model</span>
-            <select id="s-model">${modelOpts}</select>
+            <span>Provider</span>
+            <select id="s-provider">${providerOpts}</select>
           </label>
+          ${modelField}
           <label>
             <span>Permissions</span>
             <select id="s-permissions">${permOpts}</select>
           </label>
         </div>
+        ${fs.provider === 'ollama' ? `
+          <div class="row" style="margin-top: 10px;">
+            <button id="s-refresh-ollama-models" style="font-size: 12px;">Refresh Ollama Models</button>
+          </div>
+          ${fs.ollamaStatus ? `<p class="hint" style="margin-top: 8px;">${escapeHtml(fs.ollamaStatus)}</p>` : ''}
+        ` : ''}
       </div>
 
       <div class="card">
@@ -994,6 +1067,38 @@ function renderSettingsConfig(container, profile) {
       </div>
     </div>
   `;
+
+  const providerEl = container.querySelector('#s-provider');
+  providerEl?.addEventListener('change', () => {
+    settingsFormState.provider = providerEl.value;
+    if (settingsFormState.provider === 'claude' && !['opus', 'sonnet', 'haiku'].includes(settingsFormState.model)) {
+      settingsFormState.model = 'sonnet';
+    }
+    if (settingsFormState.provider === 'ollama' && ['opus', 'sonnet', 'haiku'].includes(settingsFormState.model)) {
+      settingsFormState.model = 'llama3.2';
+    }
+    settingsFormState.ollamaStatus = '';
+    renderSettingsConfig(container, profile);
+  });
+
+  const refreshBtn = container.querySelector('#s-refresh-ollama-models');
+  refreshBtn?.addEventListener('click', async () => {
+    const baseUrlEl = container.querySelector('#s-ollama-base-url');
+    const baseUrl = baseUrlEl?.value || settingsFormState.ollamaBaseUrl || DEFAULT_OLLAMA_BASE_URL;
+    const result = await window.commandsDesktop.ollama.listModels(baseUrl);
+    if (!result?.ok) {
+      settingsFormState.ollamaStatus = result?.error || 'Failed to load models';
+      renderSettingsConfig(container, profile);
+      return;
+    }
+    settingsFormState.ollamaBaseUrl = result.baseUrl || baseUrl;
+    settingsFormState.ollamaModels = Array.isArray(result.models) ? result.models : [];
+    if (!settingsFormState.model && settingsFormState.ollamaModels.length > 0) {
+      settingsFormState.model = settingsFormState.ollamaModels[0];
+    }
+    settingsFormState.ollamaStatus = `Loaded ${settingsFormState.ollamaModels.length} model(s)`;
+    renderSettingsConfig(container, profile);
+  });
 }
 
 function renderSettingsMcp(container, profile) {
