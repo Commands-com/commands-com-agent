@@ -5,6 +5,8 @@ const { spawn } = require('node:child_process');
 const { app, BrowserWindow, dialog, ipcMain, shell, safeStorage } = require('electron');
 const { randomBytes } = require('node:crypto');
 const MAX_AUDIT_RETURN_ENTRIES = 2000;
+const SHARE_TOKEN_PENDING_TTL_MS = 5 * 60 * 1000;
+const SHARE_TOKEN_RE = /^[A-Za-z0-9_-]{16,512}$/;
 
 // ---------------------------------------------------------------------------
 // Profile storage constants
@@ -160,6 +162,135 @@ function emitAgentLog(stream, message) {
     stream,
     message
   });
+}
+
+let _pendingShareToken = null;
+let _pendingShareTokenExpiresAt = 0;
+
+function clearPendingShareToken() {
+  _pendingShareToken = null;
+  _pendingShareTokenExpiresAt = 0;
+}
+
+function setPendingShareToken(token) {
+  _pendingShareToken = token;
+  _pendingShareTokenExpiresAt = Date.now() + SHARE_TOKEN_PENDING_TTL_MS;
+}
+
+function getPendingShareToken() {
+  if (!_pendingShareToken) return null;
+  if (Date.now() > _pendingShareTokenExpiresAt) {
+    clearPendingShareToken();
+    return null;
+  }
+  return _pendingShareToken;
+}
+
+function normalizeShareTokenInput(input) {
+  if (typeof input !== 'string') {
+    return { ok: false, error: 'Share link must be a string' };
+  }
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return { ok: false, error: 'Share link is required' };
+  }
+
+  const parseTokenFromUrl = (urlString) => {
+    let parsed;
+    try {
+      parsed = new URL(urlString);
+    } catch {
+      return null;
+    }
+
+    const queryToken = parsed.searchParams.get('token');
+    if (queryToken) {
+      return queryToken;
+    }
+
+    const sharePrefix = '/share/';
+    if (parsed.pathname && parsed.pathname.startsWith(sharePrefix)) {
+      const tokenPart = parsed.pathname.slice(sharePrefix.length).split('/')[0];
+      if (tokenPart) return tokenPart;
+    }
+
+    if (parsed.protocol === 'commands-desktop:' && parsed.hostname === 'share' && parsed.pathname && parsed.pathname.length > 1) {
+      const tokenPart = parsed.pathname.slice(1).split('/')[0];
+      if (tokenPart) return tokenPart;
+    }
+
+    return null;
+  };
+
+  let token = parseTokenFromUrl(trimmed);
+  if (!token) {
+    token = trimmed;
+  }
+
+  token = String(token || '').trim();
+  if (!SHARE_TOKEN_RE.test(token)) {
+    return { ok: false, error: 'Invalid share link or token format' };
+  }
+
+  return { ok: true, token };
+}
+
+async function consumeShareToken(token, source = 'manual') {
+  const normalized = normalizeShareTokenInput(token);
+  if (!normalized.ok) {
+    return { ok: false, error: normalized.error };
+  }
+
+  if (!auth.isSignedIn()) {
+    setPendingShareToken(normalized.token);
+    emitToAllWindows('desktop:gateway-share-event', {
+      type: 'share.consume.requires-auth',
+      source,
+    });
+    return { ok: false, requiresAuth: true, error: 'Sign in required to accept share links' };
+  }
+
+  try {
+    const gatewayUrl = getGatewayUrl();
+    const result = await gatewayClient.consumeShareInvite(gatewayUrl, normalized.token);
+    clearPendingShareToken();
+    emitToAllWindows('desktop:gateway-share-event', {
+      type: 'share.consume.success',
+      source,
+      deviceId: result?.deviceId || null,
+      grantId: result?.grantId || null,
+    });
+    return { ok: true, ...result };
+  } catch (err) {
+    clearPendingShareToken();
+    const message = err instanceof Error ? err.message : String(err);
+    emitToAllWindows('desktop:gateway-share-event', {
+      type: 'share.consume.error',
+      source,
+      error: message,
+    });
+    return { ok: false, error: message };
+  }
+}
+
+function maybeHandleShareDeepLink(value, source = 'deep-link') {
+  const normalized = normalizeShareTokenInput(value);
+  if (!normalized.ok) {
+    return false;
+  }
+  consumeShareToken(normalized.token, source).catch(() => {});
+  return true;
+}
+
+function handlePotentialShareArgv(argv, source = 'deep-link-argv') {
+  if (!Array.isArray(argv)) return false;
+  for (const arg of argv) {
+    if (typeof arg !== 'string') continue;
+    if (maybeHandleShareDeepLink(arg, source)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function normalizeAgentRoot(value) {
@@ -726,8 +857,7 @@ async function startAgent(payload = {}) {
     };
   }
 
-  // Keep runtime config deviceId aligned with immutable profile deviceId.
-  // Display-name changes must not mutate transport identity.
+  // Sync profile deviceId into config.json (before credential restore).
   const desiredDeviceId = normalizeProfileDeviceId(launchProfile?.deviceId);
   if (desiredDeviceId) {
     try {
@@ -767,6 +897,32 @@ async function startAgent(payload = {}) {
       error: `failed to restore credentials: ${msg}`,
       status: snapshotAgentState()
     };
+  }
+
+  // Sync desktop auth credentials into config.json AFTER credential restore.
+  // This ensures the agent runs under the same account the desktop is signed into,
+  // overriding any stale keychain-stored credentials from a different account.
+  const desktopCreds = await auth.getCredentialsForAgent();
+  if (desktopCreds) {
+    try {
+      const agentConfigPath = path.join(os.homedir(), '.commands-agent', 'config.json');
+      const raw = await fs.readFile(agentConfigPath, 'utf8');
+      const agentConfig = JSON.parse(raw);
+      if (agentConfig.ownerUID !== desktopCreds.ownerUID ||
+          agentConfig.deviceToken !== desktopCreds.accessToken) {
+        emitAgentLog('system', `[desktop] syncing auth credentials (${desktopCreds.email || 'unknown'})`);
+        agentConfig.deviceToken = desktopCreds.accessToken;
+        agentConfig.refreshToken = desktopCreds.refreshToken;
+        agentConfig.gatewayUrl = desktopCreds.gatewayUrl || agentConfig.gatewayUrl;
+        agentConfig.ownerUID = desktopCreds.ownerUID;
+        agentConfig.ownerEmail = desktopCreds.email;
+        const tmp = agentConfigPath + '.tmp.' + Date.now() + '.' + randomBytes(4).toString('hex');
+        await fs.writeFile(tmp, JSON.stringify(agentConfig, null, 2) + '\n', 'utf8');
+        await fs.rename(tmp, agentConfigPath);
+      }
+    } catch (_err) {
+      // Non-fatal — agent will use whatever credentials are in config.json
+    }
   }
 
   // Renderer-controlled runtime toggles only. All agent config comes from launchProfile.
@@ -999,6 +1155,11 @@ ipcMain.handle('desktop:open-url', async (_event, url) => {
   }
   await shell.openExternal(url);
   return { ok: true };
+});
+
+ipcMain.on('desktop:clipboard:write', (_event, text) => {
+  const { clipboard } = require('electron');
+  clipboard.writeText(String(text || ''));
 });
 
 ipcMain.handle('desktop:pick-directory', async (event, payload) => {
@@ -2040,6 +2201,85 @@ ipcMain.handle('desktop:gateway:end-session', async (_event, payload) => {
   }
 });
 
+ipcMain.handle('desktop:gateway:share-consume', async (_event, payload) => {
+  try {
+    const input = payload?.input;
+    return await consumeShareToken(input, 'renderer');
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:gateway:share-create', async (_event, payload) => {
+  try {
+    const deviceId = payload?.deviceId;
+    const email = payload?.email;
+    const grantExpiresAt = payload?.grantExpiresAt;
+    const inviteTokenTtlSeconds = payload?.inviteTokenTtlSeconds;
+
+    if (typeof deviceId !== 'string' || deviceId.length > 128 || !DEVICE_ID_RE.test(deviceId)) {
+      return { ok: false, error: 'Invalid deviceId' };
+    }
+    if (typeof email !== 'string' || email.trim().length === 0 || email.length > 320) {
+      return { ok: false, error: 'Invalid email' };
+    }
+
+    const body = {
+      deviceId,
+      email: email.trim(),
+    };
+    if (Number.isFinite(grantExpiresAt)) {
+      body.grantExpiresAt = Math.trunc(grantExpiresAt);
+    }
+    if (Number.isFinite(inviteTokenTtlSeconds)) {
+      body.inviteTokenTtlSeconds = Math.trunc(inviteTokenTtlSeconds);
+    }
+
+    const gatewayUrl = getGatewayUrl();
+    const result = await gatewayClient.createShareInvite(gatewayUrl, body);
+    emitToAllWindows('desktop:gateway-share-event', {
+      type: 'share.create.success',
+      deviceId,
+      grantId: result?.grantId || null,
+    });
+    return { ok: true, ...result };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:gateway:share-list-grants', async (_event, payload) => {
+  try {
+    const deviceId = payload?.deviceId;
+    if (typeof deviceId !== 'string' || deviceId.length > 128 || !DEVICE_ID_RE.test(deviceId)) {
+      return { ok: false, error: 'Invalid deviceId' };
+    }
+    const gatewayUrl = getGatewayUrl();
+    const result = await gatewayClient.listShareGrants(gatewayUrl, deviceId);
+    return { ok: true, ...result };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+ipcMain.handle('desktop:gateway:share-revoke', async (_event, payload) => {
+  try {
+    const grantId = payload?.grantId;
+    if (typeof grantId !== 'string' || grantId.trim().length === 0 || grantId.length > 128 || !/^[a-zA-Z0-9_-]+$/.test(grantId)) {
+      return { ok: false, error: 'Invalid grantId' };
+    }
+    const gatewayUrl = getGatewayUrl();
+    const result = await gatewayClient.revokeShareGrant(gatewayUrl, grantId.trim());
+    emitToAllWindows('desktop:gateway-share-event', {
+      type: 'share.revoke.success',
+      grantId: result?.grantId || grantId.trim(),
+    });
+    return { ok: true, ...result };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Device SSE subscription (auto-start on sign-in, auto-stop on sign-out)
 // ---------------------------------------------------------------------------
@@ -2107,14 +2347,30 @@ auth.onAuthChanged((status) => {
       stopDeviceSSE();
     }
     startDeviceSSE();
+    const pendingToken = getPendingShareToken();
+    if (pendingToken) {
+      consumeShareToken(pendingToken, 'auth-resume').catch(() => {});
+    }
   } else {
     stopDeviceSSE();
     sessionManager.endAllSessions();
     _msgTimestamps.clear();
+    clearPendingShareToken();
   }
 });
 
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  maybeHandleShareDeepLink(url, 'deep-link-open-url');
+});
+
 app.whenReady().then(async () => {
+  try {
+    app.setAsDefaultProtocolClient('commands-desktop');
+  } catch {
+    // best-effort
+  }
+
   // On startup, if credentials are in plaintext (e.g. after a crash), secure them.
   if (safeStorage.isEncryptionAvailable() && !areCredentialsSecured()) {
     try {
@@ -2126,6 +2382,8 @@ app.whenReady().then(async () => {
 
   // Try loading auth from existing agent config (skips OAuth if already registered)
   auth.tryLoadFromConfig();
+
+  handlePotentialShareArgv(process.argv.slice(1), 'deep-link-argv');
 
   createWindow();
   emitAgentStatus();

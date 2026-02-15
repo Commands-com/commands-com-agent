@@ -135,4 +135,8 @@ if [[ -n "$SYSTEM_PROMPT" ]]; then
   START_ARGS+=(--system-prompt "$SYSTEM_PROMPT")
 fi
 
+if [[ -n "$DEVICE_NAME" ]]; then
+  START_ARGS+=(--device-name "$DEVICE_NAME")
+fi
+
 exec node dist/index.js start "${START_ARGS[@]}"

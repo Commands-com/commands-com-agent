@@ -1,4 +1,6 @@
-const { contextBridge, ipcRenderer, clipboard } = require('electron');
+const { contextBridge, ipcRenderer } = require('electron');
+let clipboard;
+try { clipboard = require('electron').clipboard; } catch { /* sandboxed */ }
 let marked = null;
 try {
   ({ marked } = require('marked'));
@@ -151,7 +153,11 @@ contextBridge.exposeInMainWorld('commandsDesktop', {
     }
   },
   copyText: (text) => {
-    clipboard.writeText(String(text || ''));
+    if (clipboard) {
+      clipboard.writeText(String(text || ''));
+    } else {
+      ipcRenderer.send('desktop:clipboard:write', String(text || ''));
+    }
     return true;
   },
   auth: {
@@ -170,6 +176,10 @@ contextBridge.exposeInMainWorld('commandsDesktop', {
     startSession: (deviceId) => ipcRenderer.invoke('desktop:gateway:start-session', { deviceId }),
     sendMessage: (deviceId, text) => ipcRenderer.invoke('desktop:gateway:send-message', { deviceId, text }),
     endSession: (deviceId) => ipcRenderer.invoke('desktop:gateway:end-session', { deviceId }),
+    consumeShareLink: (input) => ipcRenderer.invoke('desktop:gateway:share-consume', { input }),
+    createShareInvite: (payload) => ipcRenderer.invoke('desktop:gateway:share-create', payload || {}),
+    listShareGrants: (deviceId) => ipcRenderer.invoke('desktop:gateway:share-list-grants', { deviceId }),
+    revokeShareGrant: (grantId) => ipcRenderer.invoke('desktop:gateway:share-revoke', { grantId }),
     onDeviceEvent: (handler) => {
       if (typeof handler !== 'function') return () => {};
       const listener = (_event, payload) => handler(payload);
@@ -181,6 +191,12 @@ contextBridge.exposeInMainWorld('commandsDesktop', {
       const listener = (_event, payload) => handler(payload);
       ipcRenderer.on('desktop:gateway-chat-event', listener);
       return () => ipcRenderer.removeListener('desktop:gateway-chat-event', listener);
+    },
+    onShareEvent: (handler) => {
+      if (typeof handler !== 'function') return () => {};
+      const listener = (_event, payload) => handler(payload);
+      ipcRenderer.on('desktop:gateway-share-event', listener);
+      return () => ipcRenderer.removeListener('desktop:gateway-share-event', listener);
     },
   },
   credentialSecurity: {

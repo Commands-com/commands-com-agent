@@ -73,6 +73,7 @@ let unsubConversation = null;
 let unsubAuthChanged = null;
 let unsubDeviceEvent = null;
 let unsubChatEvent = null;
+let unsubShareEvent = null;
 let authUid = null;
 let sharedDevicesFetchSeq = 0;
 
@@ -188,6 +189,21 @@ function subscribeIPC() {
       renderMainPanel();
     }
   });
+
+  // Share events (consume/create/revoke)
+  unsubShareEvent = window.commandsDesktop.gateway.onShareEvent((event) => {
+    if (!event || typeof event !== 'object') return;
+    if (event.type === 'share.consume.success' || event.type === 'share.revoke.success') {
+      fetchSharedDevices();
+      if (viewState.currentView === 'agent-chat') {
+        renderMainPanel();
+      }
+      return;
+    }
+    if (event.type === 'share.consume.requires-auth') {
+      renderSidebar(document.getElementById('sidebar'));
+    }
+  });
 }
 
 async function fetchSharedDevices(requestUid = authUid) {
@@ -290,6 +306,6 @@ async function init() {
 }
 
 // Make setView available to other modules
-window.__hub = { setView };
+window.__hub = { setView, refreshSharedDevices: () => fetchSharedDevices() };
 
 init();

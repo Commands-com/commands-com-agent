@@ -773,6 +773,36 @@ function getGatewayUrl() {
   return _gatewayUrl;
 }
 
+/**
+ * Get raw credentials for syncing into the agent's config.json before launch.
+ * Refreshes the access token if needed so the agent starts with a valid token.
+ * Returns null if not signed in.
+ */
+async function getCredentialsForAgent() {
+  if (!_refreshToken) return null;
+  try {
+    // Ensure we have a fresh access token
+    const freshToken = await getIdToken();
+    return {
+      accessToken: freshToken,
+      refreshToken: _refreshToken,
+      gatewayUrl: normalizeTrustedGatewayUrl(_gatewayUrl),
+      ownerUID: _uid,
+      email: _email,
+    };
+  } catch {
+    // If refresh fails, return what we have (agent can refresh on its own)
+    if (!_accessToken) return null;
+    return {
+      accessToken: _accessToken,
+      refreshToken: _refreshToken,
+      gatewayUrl: normalizeTrustedGatewayUrl(_gatewayUrl),
+      ownerUID: _uid,
+      email: _email,
+    };
+  }
+}
+
 module.exports = {
   tryLoadFromConfig,
   signIn,
@@ -782,4 +812,5 @@ module.exports = {
   isSignedIn,
   onAuthChanged,
   getGatewayUrl,
+  getCredentialsForAgent,
 };

@@ -477,10 +477,58 @@ async function deleteDevice(gatewayUrl, deviceId) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Share-link methods (app backend facade)
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a share invite link for an owned device.
+ * POST /gateway/v1/shares/invites
+ */
+async function createShareInvite(gatewayUrl, payload) {
+  return gatewayJson(`${gatewayUrl}/gateway/v1/shares/invites`, {
+    method: 'POST',
+    body: JSON.stringify(payload || {}),
+  });
+}
+
+/**
+ * Consume a share invite token.
+ * POST /gateway/v1/shares/invites/accept
+ */
+async function consumeShareInvite(gatewayUrl, token) {
+  return gatewayJson(`${gatewayUrl}/gateway/v1/shares/invites/accept`, {
+    method: 'POST',
+    body: JSON.stringify({ token }),
+  });
+}
+
+/**
+ * List grants for a device (owner view).
+ * GET /gateway/v1/shares/devices/{deviceId}/grants
+ */
+async function listShareGrants(gatewayUrl, deviceId) {
+  return gatewayJson(`${gatewayUrl}/gateway/v1/shares/devices/${encodeURIComponent(deviceId)}/grants`);
+}
+
+/**
+ * Revoke a grant (owner action).
+ * POST /gateway/v1/shares/grants/{grantId}/revoke
+ */
+async function revokeShareGrant(gatewayUrl, grantId) {
+  return gatewayJson(`${gatewayUrl}/gateway/v1/shares/grants/${encodeURIComponent(grantId)}/revoke`, {
+    method: 'POST',
+  });
+}
+
 module.exports = {
   fetchDevices,
   fetchIdentityKey,
   deleteDevice,
+  createShareInvite,
+  consumeShareInvite,
+  listShareGrants,
+  revokeShareGrant,
   initHandshake,
   pollHandshake,
   sendMessage,

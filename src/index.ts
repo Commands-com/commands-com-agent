@@ -420,6 +420,8 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
     throw new Error('reconnect-min-ms cannot be greater than reconnect-max-ms');
   }
 
+  const deviceNameOverride = flags.get('device-name')?.trim();
+
   const mcpServers = await resolveMcpServers(flags, config.mcpServers);
   const effectiveConfig: AgentConfig = {
     ...config,
@@ -428,6 +430,7 @@ async function cmdStart(flags: Map<string, string>): Promise<void> {
     policy: runtimePolicy,
     ...(mcpServers ? { mcpServers } : {}),
     ...(systemPrompt ? { systemPrompt } : {}),
+    ...(deviceNameOverride ? { deviceName: deviceNameOverride } : {}),
   };
   const savePersistentConfig = async (): Promise<void> => {
     const { policy: _policy, ...persistable } = effectiveConfig;

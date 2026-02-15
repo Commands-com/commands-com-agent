@@ -33,7 +33,21 @@ export function renderSidebar(container) {
     `;
   }).join('');
 
-  // Shared With Me section
+  // Shared With Me section — inline input replaces prompt() (unsupported in Electron)
+  const shareInputHtml = `
+    <div style="margin-top: 10px;">
+      <button class="shared-sign-in-btn" id="sidebar-consume-share-link">Paste Share Link</button>
+      <div id="share-link-input-wrap" style="display: none; margin-top: 8px;">
+        <input type="text" id="share-link-input" placeholder="Paste link or token..." style="width: 100%; padding: 6px 8px; font-size: 12px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--fg);" />
+        <div style="display: flex; gap: 6px; margin-top: 6px;">
+          <button id="share-link-submit" style="font-size: 11px; flex: 1;">Submit</button>
+          <button id="share-link-cancel" style="font-size: 11px;">Cancel</button>
+        </div>
+        <div id="share-link-error" style="display: none; font-size: 11px; color: var(--danger); margin-top: 4px;"></div>
+      </div>
+    </div>
+  `;
+
   let sharedSection = '';
   if (authState.signedIn) {
     const devices = sharedAgentsState.devices;
@@ -61,6 +75,7 @@ export function renderSidebar(container) {
           <div class="shared-agents-list" id="shared-agent-list">
             ${deviceCards}
           </div>
+          ${shareInputHtml}
         </div>
       `;
     } else {
@@ -76,6 +91,7 @@ export function renderSidebar(container) {
             </svg>
             <span>No agents shared with you yet</span>
           </div>
+          ${shareInputHtml}
         </div>
       `;
     }
@@ -91,6 +107,7 @@ export function renderSidebar(container) {
           </svg>
           Sign in to see shared agents
         </button>
+        ${shareInputHtml}
       </div>
     `;
   }
@@ -178,6 +195,79 @@ export function renderSidebar(container) {
           if (!result?.ok) resetSignInBtn();
         })
         .catch(() => resetSignInBtn());
+    });
+  }
+
+  // Inline share-link input (replaces unsupported prompt())
+  const consumeBtn = container.querySelector('#sidebar-consume-share-link');
+  const shareWrap = container.querySelector('#share-link-input-wrap');
+  const shareInput = container.querySelector('#share-link-input');
+  const shareSubmit = container.querySelector('#share-link-submit');
+  const shareCancel = container.querySelector('#share-link-cancel');
+  const shareError = container.querySelector('#share-link-error');
+
+  function hideShareInput() {
+    if (shareWrap) shareWrap.style.display = 'none';
+    if (shareInput) shareInput.value = '';
+    if (shareError) { shareError.style.display = 'none'; shareError.textContent = ''; }
+    if (consumeBtn) consumeBtn.style.display = '';
+  }
+
+  async function submitShareLink() {
+    const value = shareInput?.value?.trim();
+    if (!value) return;
+
+    shareSubmit.disabled = true;
+    shareSubmit.textContent = 'Processing...';
+    if (shareError) shareError.style.display = 'none';
+
+    try {
+      const result = await window.commandsDesktop.gateway.consumeShareLink(value);
+      if (result?.ok) {
+        hideShareInput();
+        if (window.__hub?.refreshSharedDevices) {
+          window.__hub.refreshSharedDevices();
+        }
+        return;
+      }
+
+      if (result?.requiresAuth) {
+        hideShareInput();
+        const authResult = await window.commandsDesktop.auth.signIn();
+        if (!authResult?.ok && shareError) {
+          shareError.textContent = authResult?.error || 'Sign in failed';
+          shareError.style.display = '';
+        }
+        return;
+      }
+
+      if (shareError) {
+        shareError.textContent = result?.error || 'Failed to consume share link';
+        shareError.style.display = '';
+      }
+    } catch (err) {
+      if (shareError) {
+        shareError.textContent = err?.message || 'Failed to consume share link';
+        shareError.style.display = '';
+      }
+    } finally {
+      if (shareSubmit) { shareSubmit.disabled = false; shareSubmit.textContent = 'Submit'; }
+    }
+  }
+
+  if (consumeBtn && shareWrap) {
+    consumeBtn.addEventListener('click', () => {
+      consumeBtn.style.display = 'none';
+      shareWrap.style.display = '';
+      shareInput?.focus();
+    });
+  }
+  if (shareCancel) shareCancel.addEventListener('click', hideShareInput);
+  if (shareSubmit) shareSubmit.addEventListener('click', submitShareLink);
+  if (shareInput) {
+    shareInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); submitShareLink(); }
+      if (e.key === 'Escape') hideShareInput();
     });
   }
 

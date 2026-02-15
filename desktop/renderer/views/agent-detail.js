@@ -9,7 +9,7 @@ import {
   runtimeState, isProfileRunning, isAnyAgentRunning, runningProfileId,
   appendLog, clearLogs,
   auditState, resetAuditState, DEFAULT_AUDIT_LIMIT, MAX_AUDIT_LIMIT, clamp,
-  DEFAULT_GATEWAY_URL,
+  DEFAULT_GATEWAY_URL, authState,
   conversationState, getSessionList, getSelectedSession,
 } from '../state.js';
 import { renderMarkdownUntrusted } from '../markdown.js';
@@ -37,6 +37,7 @@ const TABS = [
   { id: 'logs', label: 'Logs' },
   { id: 'audit', label: 'Audit Trail' },
   { id: 'settings', label: 'Settings' },
+  { id: 'sharing', label: 'Sharing' },
 ];
 
 let currentProfile = null;
@@ -182,6 +183,9 @@ function renderTabContent(container, tab, profile, extra = {}) {
       break;
     case 'settings':
       renderSettingsTab(container, profile, extra);
+      break;
+    case 'sharing':
+      renderSharingTab(container, profile);
       break;
   }
 }
@@ -676,7 +680,7 @@ function wireAuditEntryActions(container) {
 }
 
 // ---------------------------------------------------------------------------
-// Settings tab — sub-tabbed: Identity | Config | MCP | Security
+// Settings tab — sub-tabbed: Identity | Config | MCP | Security (credentials only)
 // ---------------------------------------------------------------------------
 
 const SETTINGS_SUB_TABS = [
@@ -844,7 +848,7 @@ function renderSettingsSubContent(container, profile, extra) {
       renderSettingsMcp(container, profile);
       break;
     case 'security':
-      renderSettingsSecurity(container);
+      renderSettingsSecurity(container, profile);
       break;
   }
 }
@@ -1043,7 +1047,7 @@ function renderSettingsMcp(container, profile) {
   });
 }
 
-function renderSettingsSecurity(container) {
+function renderSettingsSecurity(container, profile) {
   container.innerHTML = `
     <div style="max-width: 580px;">
       <div class="card">
@@ -1068,6 +1072,66 @@ function renderSettingsSecurity(container) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Sharing tab (top-level)
+// ---------------------------------------------------------------------------
+
+function renderSharingTab(container, profile) {
+  const signedIn = authState.signedIn;
+  const hasDeviceId = typeof profile?.deviceId === 'string' && profile.deviceId.trim() !== '';
+
+  container.innerHTML = `
+    <div style="max-width: 580px;">
+      <div class="card">
+        <h3>Share This Agent</h3>
+        <p style="font-size: 12px; color: var(--muted); margin-bottom: 12px;">
+          Create a share link to give someone access to chat with this agent.
+        </p>
+        ${!signedIn ? `
+          <p style="font-size: 12px; color: var(--muted); margin-bottom: 10px;">
+            Sign in to create, consume, and revoke share links.
+          </p>
+          <button id="sharing-sign-in-btn">Sign In</button>
+        ` : !hasDeviceId ? `
+          <p style="font-size: 12px; color: var(--danger);">This profile is missing a device ID. Start the agent at least once to generate one.</p>
+        ` : `
+          <div class="field-grid" style="margin-bottom: 8px;">
+            <label>
+              <span>Invite Email</span>
+              <input type="email" id="share-email" placeholder="teammate@example.com" maxlength="320" />
+            </label>
+          </div>
+          <div class="row" style="gap: 8px; margin-bottom: 8px;">
+            <button id="share-create-btn" style="font-size: 12px;">Create Share Link</button>
+            <button id="share-refresh-btn" style="font-size: 12px;">Refresh Grants</button>
+          </div>
+          <div id="share-create-result" class="hint" style="margin-bottom: 8px;"></div>
+          <div id="share-manage-status" class="hint" style="margin-bottom: 8px;"></div>
+        `}
+      </div>
+
+      ${signedIn && hasDeviceId ? `
+        <div class="card">
+          <h3>Active Grants</h3>
+          <div id="share-grants-list" class="audit-entries"></div>
+        </div>
+      ` : ''}
+    </div>
+  `;
+
+  container.querySelector('#sharing-sign-in-btn')?.addEventListener('click', async () => {
+    const result = await window.commandsDesktop.auth.signIn();
+    if (!result?.ok) return;
+    const mainPanel = document.getElementById('main-panel');
+    if (mainPanel) renderAgentDetail(mainPanel, profile.id);
+  });
+
+  if (signedIn && hasDeviceId) {
+    wireShareActions(container, profile);
+    loadShareGrants(container, profile.deviceId);
+  }
+}
+
 async function loadCredentialStatus(container) {
   const result = await window.commandsDesktop.credentialSecurity.getStatus();
   const el = container.querySelector('#cred-status');
@@ -1084,6 +1148,121 @@ async function loadCredentialStatus(container) {
   } else {
     el.textContent = 'Could not check credential status.';
   }
+}
+
+async function loadShareGrants(container, deviceId) {
+  const listEl = container.querySelector('#share-grants-list');
+  const statusEl = container.querySelector('#share-manage-status');
+  if (!listEl) return;
+
+  listEl.innerHTML = '<p class="audit-empty">Loading grants...</p>';
+  if (statusEl) statusEl.textContent = '';
+
+  const result = await window.commandsDesktop.gateway.listShareGrants(deviceId);
+  if (!result?.ok) {
+    listEl.innerHTML = '<p class="audit-empty" style="color: var(--danger);">Failed to load grants.</p>';
+    if (statusEl) statusEl.textContent = result?.error || '';
+    return;
+  }
+
+  const allGrants = Array.isArray(result.grants) ? result.grants : [];
+  // Hide revoked/expired grants — they're kept for audit but clutter the UI.
+  const grants = allGrants.filter((g) => g.status !== 'revoked' && g.status !== 'expired');
+  if (grants.length === 0) {
+    listEl.innerHTML = '<p class="audit-empty">No active or pending grants.</p>';
+    return;
+  }
+
+  const rows = grants.map((g) => {
+    const grantId = g.grantId || '';
+    const status = g.status || '';
+    const canRevoke = status === 'active' || status === 'pending' || status === 'suspended';
+    const email = g.granteeEmail || g.granteeUid || '(unknown)';
+    return `
+      <div class="audit-entry" data-grant-id="${escapeHtml(grantId)}">
+        <div class="audit-entry-head">
+          <span class="audit-event">${escapeHtml(email)}</span>
+          <span class="audit-time">${escapeHtml(status)}</span>
+        </div>
+        <div class="audit-meta">Grant: <code>${escapeHtml(grantId)}</code></div>
+        ${canRevoke ? `<button class="danger revoke-share-grant-btn" data-grant-id="${escapeHtml(grantId)}" style="font-size: 11px; margin-top: 8px;">Revoke</button>` : ''}
+      </div>
+    `;
+  }).join('');
+
+  listEl.innerHTML = rows;
+  listEl.querySelectorAll('.revoke-share-grant-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const grantId = btn.dataset.grantId;
+      if (!grantId) return;
+      const confirmed = confirm(`Revoke grant ${grantId}?`);
+      if (!confirmed) return;
+      btn.disabled = true;
+      const revokeResult = await window.commandsDesktop.gateway.revokeShareGrant(grantId);
+      if (!revokeResult?.ok && statusEl) {
+        statusEl.textContent = revokeResult?.error || 'Failed to revoke grant';
+      }
+      loadShareGrants(container, deviceId);
+      if (window.__hub?.refreshSharedDevices) {
+        window.__hub.refreshSharedDevices();
+      }
+    });
+  });
+}
+
+function wireShareActions(container, profile) {
+  const emailInput = container.querySelector('#share-email');
+  const resultEl = container.querySelector('#share-create-result');
+  const statusEl = container.querySelector('#share-manage-status');
+  const createBtn = container.querySelector('#share-create-btn');
+
+  createBtn?.addEventListener('click', async () => {
+    const email = emailInput?.value?.trim() || '';
+    if (!email) {
+      if (statusEl) statusEl.textContent = 'Invite email is required';
+      return;
+    }
+    if (statusEl) statusEl.textContent = '';
+    if (resultEl) resultEl.textContent = '';
+    createBtn.disabled = true;
+
+    try {
+      const result = await window.commandsDesktop.gateway.createShareInvite({
+        deviceId: profile.deviceId,
+        email,
+      });
+      if (!result?.ok) {
+        if (statusEl) statusEl.textContent = result?.error || 'Failed to create share link';
+        return;
+      }
+
+      const inviteUrl = result?.inviteUrl || '';
+      if (inviteUrl && resultEl) {
+        resultEl.innerHTML = `
+          <div style="display:flex; gap: 8px; align-items:center; flex-wrap:wrap;">
+            <code style="font-size:11px;">${escapeHtml(inviteUrl)}</code>
+            <button id="copy-share-link-btn" style="font-size:11px;">Copy</button>
+          </div>
+        `;
+        resultEl.querySelector('#copy-share-link-btn')?.addEventListener('click', (e) => {
+          window.commandsDesktop.copyText(inviteUrl);
+          const btn = e.currentTarget;
+          btn.textContent = 'Copied!';
+          btn.disabled = true;
+          setTimeout(() => { btn.textContent = 'Copy'; btn.disabled = false; }, 2000);
+        });
+      }
+
+      if (emailInput) emailInput.value = '';
+      loadShareGrants(container, profile.deviceId);
+    } finally {
+      createBtn.disabled = false;
+    }
+  });
+
+  container.querySelector('#share-refresh-btn')?.addEventListener('click', () => {
+    loadShareGrants(container, profile.deviceId);
+  });
 }
 
 // ---------------------------------------------------------------------------
