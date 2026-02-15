@@ -200,6 +200,7 @@ export function renderAgentChat(container, deviceId) {
         </div>
         <div class="chat-header-actions">
           ${(sessionReady || isConnecting || isProcessing) ? '<button class="danger" id="chat-disconnect">Disconnect</button>' : ''}
+          <button class="danger" id="chat-delete-share">Delete</button>
           <button id="chat-back">Back</button>
         </div>
       </div>
@@ -281,6 +282,38 @@ function wireUpChatEvents(container, deviceId) {
   if (backBtn) {
     backBtn.addEventListener('click', () => {
       window.__hub.setView('dashboard');
+    });
+  }
+
+  const deleteBtn = container.querySelector('#chat-delete-share');
+  if (deleteBtn) {
+    deleteBtn.addEventListener('click', async () => {
+      const device = getDevice(deviceId);
+      const name = device?.display_name || device?.name || deviceId;
+      if (!confirm(`Remove "${name}" from your shared agents?`)) return;
+      const grantId = device?.grant_id;
+      if (!grantId) {
+        alert('Cannot remove — no grant ID found for this device.');
+        return;
+      }
+      deleteBtn.disabled = true;
+      deleteBtn.textContent = 'Removing...';
+      try {
+        const result = await window.commandsDesktop.gateway.leaveShareGrant(grantId);
+        if (result?.ok) {
+          window.commandsDesktop.gateway.endSession(deviceId).catch(() => {});
+          if (window.__hub?.refreshSharedDevices) window.__hub.refreshSharedDevices();
+          window.__hub.setView('dashboard');
+        } else {
+          alert(result?.error || 'Failed to remove shared agent.');
+          deleteBtn.disabled = false;
+          deleteBtn.textContent = 'Delete';
+        }
+      } catch (err) {
+        alert(err?.message || 'Failed to remove shared agent.');
+        deleteBtn.disabled = false;
+        deleteBtn.textContent = 'Delete';
+      }
     });
   }
 

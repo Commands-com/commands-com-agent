@@ -215,7 +215,7 @@ function subscribeIPC() {
   // Share events (consume/create/revoke)
   unsubShareEvent = window.commandsDesktop.gateway.onShareEvent((event) => {
     if (!event || typeof event !== 'object') return;
-    if (event.type === 'share.consume.success' || event.type === 'share.revoke.success') {
+    if (event.type === 'share.consume.success' || event.type === 'share.revoke.success' || event.type === 'share.leave.success') {
       fetchSharedDevices();
       if (viewState.currentView === 'agent-chat') {
         renderMainPanel();

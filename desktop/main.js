@@ -2459,6 +2459,24 @@ ipcMain.handle('desktop:gateway:share-revoke', async (_event, payload) => {
   }
 });
 
+ipcMain.handle('desktop:gateway:share-leave', async (_event, payload) => {
+  try {
+    const grantId = payload?.grantId;
+    if (typeof grantId !== 'string' || grantId.trim().length === 0 || grantId.length > 128 || !/^[a-zA-Z0-9_-]+$/.test(grantId)) {
+      return { ok: false, error: 'Invalid grantId' };
+    }
+    const gatewayUrl = getGatewayUrl();
+    const result = await gatewayClient.leaveShareGrant(gatewayUrl, grantId.trim());
+    emitToAllWindows('desktop:gateway-share-event', {
+      type: 'share.leave.success',
+      grantId: result?.grantId || grantId.trim(),
+    });
+    return { ok: true, ...result };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Device SSE subscription (auto-start on sign-in, auto-stop on sign-out)
 // ---------------------------------------------------------------------------

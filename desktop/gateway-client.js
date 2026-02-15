@@ -521,6 +521,16 @@ async function revokeShareGrant(gatewayUrl, grantId) {
   });
 }
 
+/**
+ * Leave a grant (collaborator action — remove yourself from a share).
+ * POST /gateway/v1/shares/grants/{grantId}/leave
+ */
+async function leaveShareGrant(gatewayUrl, grantId) {
+  return gatewayJson(`${gatewayUrl}/gateway/v1/shares/grants/${encodeURIComponent(grantId)}/leave`, {
+    method: 'POST',
+  });
+}
+
 module.exports = {
   fetchDevices,
   fetchIdentityKey,
@@ -529,6 +539,7 @@ module.exports = {
   consumeShareInvite,
   listShareGrants,
   revokeShareGrant,
+  leaveShareGrant,
   initHandshake,
   pollHandshake,
   sendMessage,

@@ -183,6 +183,7 @@ contextBridge.exposeInMainWorld('commandsDesktop', {
     createShareInvite: (payload) => ipcRenderer.invoke('desktop:gateway:share-create', payload || {}),
     listShareGrants: (deviceId) => ipcRenderer.invoke('desktop:gateway:share-list-grants', { deviceId }),
     revokeShareGrant: (grantId) => ipcRenderer.invoke('desktop:gateway:share-revoke', { grantId }),
+    leaveShareGrant: (grantId) => ipcRenderer.invoke('desktop:gateway:share-leave', { grantId }),
     onDeviceEvent: (handler) => {
       if (typeof handler !== 'function') return () => {};
       const listener = (_event, payload) => handler(payload);
